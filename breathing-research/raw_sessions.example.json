@@ -1,0 +1,22 @@
+{
+  "recordings": [
+    {
+      "experiment_id": "day02-empty-01",
+      "session_id": "day02",
+      "raw_file": "../espectre/data/empty/REPLACE_WITH_CAPTURE_FILENAME.npz",
+      "score_file": "data/day02-empty-01.jsonl",
+      "posture": "empty",
+      "condition": "empty",
+      "position": "desk"
+    },
+    {
+      "experiment_id": "day02-sitting-01",
+      "session_id": "day02",
+      "raw_file": "../espectre/data/static_presence/REPLACE_WITH_CAPTURE_FILENAME.npz",
+      "score_file": "data/day02-sitting-01.jsonl",
+      "posture": "sitting",
+      "condition": "quiet",
+      "position": "desk"
+    }
+  ]
+}

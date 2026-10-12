@@ -70,7 +70,10 @@ def sigmoid(value):
     return exp / (1 + exp)
 
 
-def fit(rows, epochs=800, regularization=0.1):
+def fit(rows, epochs=800, regularization=0.1, feature_names=None):
+    names = FEATURES if feature_names is None else feature_names
+    if not names or any(len(row["features"]) != len(names) for row in rows):
+        raise ValueError("Feature dimensions do not match model definition")
     counts = {}
     labels = {}
     for row in rows:
@@ -82,11 +85,11 @@ def fit(rows, epochs=800, regularization=0.1):
         raise ValueError("Both empty and occupied recordings are required")
     # Each class receives half the weight; each recording within a class is equal.
     weights = [0.5 / class_counts[r["label"]] / counts[r["recording"]] for r in rows]
-    means = [sum(w * r["features"][j] for w, r in zip(weights, rows)) for j in range(len(FEATURES))]
+    means = [sum(w * r["features"][j] for w, r in zip(weights, rows)) for j in range(len(names))]
     scales = [max(1e-6, math.sqrt(sum(w * (r["features"][j] - means[j]) ** 2
-                                    for w, r in zip(weights, rows)))) for j in range(len(FEATURES))]
+                                    for w, r in zip(weights, rows)))) for j in range(len(names))]
     xs = [[(x - mean) / scale for x, mean, scale in zip(r["features"], means, scales)] for r in rows]
-    coefficients, intercept = [0.0] * len(FEATURES), 0.0
+    coefficients, intercept = [0.0] * len(names), 0.0
     for _ in range(epochs):
         gradients = [regularization * coefficient for coefficient in coefficients]
         bias_gradient = 0.0
@@ -97,7 +100,7 @@ def fit(rows, epochs=800, regularization=0.1):
                 gradients[j] += residual * value
         intercept -= 0.1 * bias_gradient
         coefficients = [c - 0.1 * g for c, g in zip(coefficients, gradients)]
-    return {"feature_names": FEATURES, "means": means, "scales": scales,
+    return {"feature_names": names, "means": means, "scales": scales,
             "coefficients": coefficients, "intercept": intercept,
             "epochs": epochs, "regularization": regularization}
 
@@ -107,12 +110,13 @@ def predict(model, values):
     return sigmoid(model["intercept"] + sum(a * b for a, b in zip(model["coefficients"], xs)))
 
 
-def evaluate(rows):
+def evaluate(rows, feature_names=None, group_key="recording"):
     predictions = []
     for name in sorted({r["recording"] for r in rows}):
-        train = [r for r in rows if r["recording"] != name]
         held_out = [r for r in rows if r["recording"] == name]
-        model = fit(train)
+        held_group = held_out[0][group_key]
+        train = [r for r in rows if r[group_key] != held_group]
+        model = fit(train, feature_names=feature_names)
         scores = [predict(model, r["features"]) for r in held_out]
         score = statistics.mean(scores)
         predictions.append({"recording": name, "label": held_out[0]["label"],

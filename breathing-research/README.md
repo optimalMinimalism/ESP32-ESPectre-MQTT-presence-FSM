@@ -82,6 +82,41 @@ python3 breathing-research/live_presence.py \
   --replay breathing-research/data/layingBack-00.jsonl --json
 ```
 
+## Raw CSI and matched comparisons
+
+The raw research path trains a separate occupied/empty model and compares its held-out predictions with a processed-score model trained on matching trials. This is a comparison of two inputs, not a synchronized fused model. It uses per-packet amplitude normalization and six features describing temporal channel-shape variation, adjacent-profile displacement, and spatial variation. It requires normalized HT20 int8 NPZ recordings with trustworthy per-packet `device_ticks_us`, a nominal 100 pps capture, and at least 85% slot coverage in each accepted window.
+
+The NumPy analysis environment is separate from the ESPectre CLI environment:
+
+```bash
+python3 -m venv breathing-research/.venv
+breathing-research/.venv/bin/python -m pip install -r breathing-research/requirements-raw.txt
+```
+
+For each trial, first record 60 seconds of processed scores with `score_research.py record`, as above. Then, keeping the boards, person, and position unchanged, record raw CSI using your working ESPectre CLI environment from `espectre/`:
+
+```bash
+./espectre collect --target http://192.168.4.2:62587/espectre/v1 \
+  --label empty --duration 60 --pps 100 --detector high_accuracy
+
+./espectre collect --target http://192.168.4.2:62587/espectre/v1 \
+  --label static_presence --duration 60 --pps 100 --detector high_accuracy
+```
+
+These are separate commands for separate conditions: leave the room for `empty`, and stay in the desired occupied position for `static_presence`. The CLI prints the saved NPZ path. With a fixed duration, interrupting raw collection discards the recording. Raw collection pauses normal motion events and affects any FSM using them. Use a dedicated research S3 to keep the FSM's sensing nodes running. The collector switches the device to external traffic and leaves it there; restore the previous traffic mode in the panel after collection before resuming ordinary score monitoring. Do not run the live score reader on the same board during raw collection.
+
+Copy `raw_sessions.example.json` to `raw_sessions.local.json`, replace the placeholder paths, and add one entry for every trial. Paths are relative to the manifest file. Keep `session_id`, posture, and condition consistent with the matching score recording, and give every pair a unique `experiment_id`. To make a recording distinguishable across days, include the day in its filename. For raw-only training, omit `score_file` from every entry.
+
+```bash
+breathing-research/.venv/bin/python breathing-research/raw_presence.py \
+  --manifest breathing-research/raw_sessions.local.json \
+  --output breathing-research/reports/raw-comparison-01
+
+breathing-research/.venv/bin/python -m unittest discover -s breathing-research -v
+```
+
+Collect at least two independent empty and two occupied trials for a first exploratory recording holdout. Repeat both classes on another day; with multiple session IDs, the script holds out whole sessions instead. Every training fold must contain both labels. The output includes raw and processed model artifacts, capture-quality summaries, and `cross-examination.csv` showing where the models agree or disagree. Results from separate captures cannot establish synchronized fusion performance. Raw models are not compatible with `live_presence.py`, which expects processed score features.
+
 ## Help and offline checks
 
 ```bash

@@ -1,2 +1,4 @@
 __pycache__/
 reports/
+.venv/
+raw_sessions.local.json
