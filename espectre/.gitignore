@@ -1,0 +1,98 @@
+# CTest
+test/build/
+test/build-coverage/
+test/cpp/build/
+test/cpp/build-ci/
+test/cpp/build-coverage/
+*.elf
+*.bin
+*.map
+
+# Code Coverage
+*.profraw
+*.profdata
+coverage.lcov
+coverage.xml
+test/cpp/coverage-summary.json
+.coverage
+test/.coverage.tmp.lcov
+htmlcov/
+
+# Local caches, generated reports, and distribution files
+/.cache/
+.bench_*/
+
+# Local external datasets that cannot be redistributed
+data/untracked/
+
+# Training run reports: per-run evidence, kept out of the tree so the numbers
+# quoted in docs and ADRs stay the reviewed ones
+data/auto_generated/mlp_seed_search.json
+data/auto_generated/mlp_architecture_experiment.json
+data/auto_generated/mlp_fp_weight_experiment.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.matplotlib/
+src/python/micro_espectre/config_local.py
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# ESPHome
+.esphome/
+src/cpp/frontend/esphome/examples/.signed-*.yaml
+secrets.yaml
+
+#ESP-IDF app build artifacts
+src/cpp/frontend/*/app/build*
+src/cpp/frontend/*/app/managed_components/
+src/cpp/frontend/*/app/sdkconfig
+src/cpp/frontend/*/app/sdkconfig.old
+src/cpp/frontend/*/app/sdkconfig.wifi
+src/cpp/frontend/*/app/dependencies.lock
+src/cpp/examples/*/build*/
+src/cpp/examples/*/managed_components/
+src/cpp/examples/*/sdkconfig
+src/cpp/examples/*/sdkconfig.old
+src/cpp/examples/*/dependencies.lock
+
+# Editor
+.tmp/
+.vscode/
+.kiro/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+.log.
+
+# Local occupancy configuration and generated event captures
+/config/occupancy.yaml
+/occupancy-events.csv
+/occupancy-events.jsonl
+
+# Local benchmark config
+tools/benchmark_firmware.local.env
+
+# MicroPython firmware cache
+/src/python/micro_espectre/.firmware/
+
+# Documentation
+.papers/
+.ga/
+
+# MQTT broker configuration
+mosquitto.conf
+
+# Hardware validation
+test/hardware/

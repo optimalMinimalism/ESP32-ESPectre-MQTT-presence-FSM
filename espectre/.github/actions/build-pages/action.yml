@@ -1,0 +1,80 @@
+name: Build and verify Pages tree
+description: Build the generated website, SDK API reference, and channel artifacts consistently.
+
+inputs:
+  require-preview:
+    description: Require the rolling preview firmware and SDK channels.
+    required: false
+    default: "false"
+  require-release:
+    description: Require the release firmware and SDK channels.
+    required: false
+    default: "false"
+  require-develop:
+    description: Require the rolling develop firmware channel.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Stage browser dependencies
+      shell: bash
+      run: |
+        npm --prefix docs/web ci --ignore-scripts
+        npm --prefix docs/web run stage:vendor
+
+    - name: Test web client
+      shell: bash
+      run: ./test/web/run_coverage.sh
+
+    - name: Build static pages
+      shell: bash
+      run: python3 .github/scripts/build_static_pages.py
+
+    - uses: ./.github/actions/setup-doxygen
+
+    - name: Install Graphviz
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Use only Ubuntu sources so unrelated third-party indexes cannot block the build.
+        test -s /etc/apt/sources.list.d/ubuntu.sources
+        apt_options=(
+          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+          -o Dir::Etc::sourceparts=-
+          -o APT::Get::List-Cleanup=0
+        )
+        sudo apt-get "${apt_options[@]}" update --error-on=any
+        sudo apt-get "${apt_options[@]}" install -y --no-install-recommends graphviz
+
+    - name: Install SDK API renderer dependencies
+      shell: bash
+      run: python3 -m pip install Jinja2==3.1.6 Pygments==2.20.0
+
+    - name: Generate SDK API reference
+      shell: bash
+      run: python3 .github/scripts/generate_sdk_api.py
+
+    - name: Generate sitemap lastmod values
+      shell: bash
+      run: python3 .github/scripts/build_sitemap.py
+
+    - name: Verify website
+      shell: bash
+      env:
+        REQUIRE_PREVIEW: ${{ inputs.require-preview }}
+        REQUIRE_RELEASE: ${{ inputs.require-release }}
+        REQUIRE_DEVELOP: ${{ inputs.require-develop }}
+      run: |
+        args=()
+        if [[ "${REQUIRE_PREVIEW}" == "true" ]]; then
+          args+=(--require-preview)
+        fi
+        if [[ "${REQUIRE_RELEASE}" == "true" ]]; then
+          args+=(--require-release)
+        fi
+        if [[ "${REQUIRE_DEVELOP}" == "true" ]]; then
+          args+=(--require-develop)
+        fi
+        python3 .github/scripts/verify_web_build.py "${args[@]}"

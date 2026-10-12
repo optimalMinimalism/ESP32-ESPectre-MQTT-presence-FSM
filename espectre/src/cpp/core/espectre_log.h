@@ -1,0 +1,134 @@
+/*
+ * ESPectre - Log Sink
+ *
+ * Portable logging contract shared by the SDK and its frontends.
+ *
+ * Author: Francesco Pace <francesco.pace@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Commercial licensing available under separate agreement; see LICENSING.md.
+ */
+#pragma once
+
+#include <cstdarg>
+#include <cstdint>
+
+namespace espectre {
+
+/** Severity attached to one ESPectre log message. */
+enum class LogLevel : uint8_t {
+  ERROR = 1,
+  WARNING = 2,
+  INFO = 3,
+  DEBUG = 4,
+  VERBOSE = 5,
+};
+
+/** Return whether a sink accepts a message with the supplied level and tag. */
+using LogEnabledCallback = bool (*)(void *context, LogLevel level, const char *tag);
+
+/** Consume one enabled ESPectre log message before the supplied argument list expires. */
+using LogWriteCallback = void (*)(void *context, LogLevel level, const char *tag, int line,
+                                  const char *format, va_list args);
+
+/**
+ * Frontend-owned logging callbacks.
+ *
+ * ESPectre copies this value when it is registered but does not own `context`.
+ * The context and callbacks must remain valid until the sink is cleared.
+ */
+struct LogSink {
+  /** Opaque value passed to both callbacks. May be `nullptr`. */
+  void *context{nullptr};
+  /** Required filter, asked before a message is formatted. */
+  LogEnabledCallback enabled{nullptr};
+  /** Required writer for messages that passed the filter. */
+  LogWriteCallback write{nullptr};
+};
+
+/**
+ * Register a complete frontend logging sink.
+ *
+ * Registration must happen before runtime setup, and replacement is supported
+ * only while no ESPectre runtime is active. An invalid sink leaves the current
+ * registration unchanged.
+ *
+ * @param sink Callback value copied by ESPectre.
+ * @return `true` when both required callbacks were registered.
+ */
+bool set_log_sink(const LogSink &sink);
+
+/** Clear the current sink while no ESPectre runtime is active. */
+void clear_log_sink();
+
+/**
+ * Return whether the current sink accepts one level and tag.
+ *
+ * @param level Message severity.
+ * @param tag Stable logger tag.
+ * @return `false` when no complete sink is registered or the sink filters the message.
+ */
+bool log_enabled(LogLevel level, const char *tag);
+
+/** @cond INTERNAL */
+namespace detail {
+
+void log_printf(LogLevel level, const char *tag, int line, const char *format, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 4, 5)))
+#endif
+    ;
+
+// Time the calling thread spent inside the sink's write callback, so a runtime
+// loop can tell a blocking frontend logger apart from its own work.
+struct LogSinkTiming {
+  uint64_t total_us{0U};
+  uint32_t writes{0U};
+  uint32_t maximum_us{0U};
+};
+
+// Return and clear the calling thread's sink timing since the previous call.
+LogSinkTiming take_log_sink_timing();
+
+// Accumulated sink time on this thread since the previous take. Does not clear.
+uint64_t log_sink_total_us();
+
+}  // namespace detail
+/** @endcond */
+
+}  // namespace espectre
+
+/**
+ * @name Logging macros
+ * Log a printf-style message through the registered LogSink. The arguments are
+ * evaluated only when the sink accepts the level and tag, and nothing happens
+ * without a sink.
+ * @{
+ */
+
+/** Log at an explicit `LogLevel`. */
+#define ESPECTRE_LOG_AT_LEVEL(level, tag, format, ...)                                            \
+  do {                                                                                            \
+    const char *const espectre_log_tag__ = (tag);                                                 \
+    if (::espectre::log_enabled((level), espectre_log_tag__)) {                                   \
+      ::espectre::detail::log_printf((level), espectre_log_tag__, __LINE__, (format),             \
+                                     ##__VA_ARGS__);                                               \
+    }                                                                                             \
+  } while (false)
+
+/** Log at `LogLevel::ERROR`. */
+#define ESPECTRE_LOGE(tag, format, ...)                                                           \
+  ESPECTRE_LOG_AT_LEVEL(::espectre::LogLevel::ERROR, tag, format, ##__VA_ARGS__)
+/** Log at `LogLevel::WARNING`. */
+#define ESPECTRE_LOGW(tag, format, ...)                                                           \
+  ESPECTRE_LOG_AT_LEVEL(::espectre::LogLevel::WARNING, tag, format, ##__VA_ARGS__)
+/** Log at `LogLevel::INFO`. */
+#define ESPECTRE_LOGI(tag, format, ...)                                                           \
+  ESPECTRE_LOG_AT_LEVEL(::espectre::LogLevel::INFO, tag, format, ##__VA_ARGS__)
+/** Log at `LogLevel::DEBUG`. */
+#define ESPECTRE_LOGD(tag, format, ...)                                                           \
+  ESPECTRE_LOG_AT_LEVEL(::espectre::LogLevel::DEBUG, tag, format, ##__VA_ARGS__)
+/** Log at `LogLevel::VERBOSE`. */
+#define ESPECTRE_LOGV(tag, format, ...)                                                           \
+  ESPECTRE_LOG_AT_LEVEL(::espectre::LogLevel::VERBOSE, tag, format, ##__VA_ARGS__)
+
+/** @} */

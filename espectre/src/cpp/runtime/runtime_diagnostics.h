@@ -1,0 +1,111 @@
+/*
+ * ESPectre - Runtime Diagnostics
+ *
+ * Runtime diagnostics rate sampling.
+ *
+ * Author: Francesco Pace <francesco.pace@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Commercial licensing available under separate agreement; see LICENSING.md.
+ */
+#pragma once
+
+#include <cstdint>
+
+#include "runtime_snapshot.h"
+
+namespace espectre {
+
+/**
+ * Rate and link diagnostics derived from cumulative runtime counters.
+ *
+ * Produced by the runtime-owned `RuntimeDiagnosticsSampler`. The rates are
+ * what the runtime's monotonic totals moved by between two periodic sensing
+ * updates, and every frontend reads the same latest sample.
+ *
+ * A zero rate means the counter did not move over the interval, and the first
+ * sample after `RuntimeDiagnosticsSampler::reset()` reports zero rates because
+ * it establishes the baseline. The link fields are carried through either way.
+ */
+struct RuntimeDiagnosticsSample {
+  /** Successful internal generator sends per second; zero in external mode. */
+  float generator_pps{0.0f};
+  /** Station network packets per second accepted by the driver. */
+  float traffic_tx_pps{0.0f};
+  /** Station network packets per second delivered by the driver. */
+  float traffic_rx_pps{0.0f};
+  /** Raw CSI callbacks per second, before any capture-level validation. */
+  float csi_callback_pps{0.0f};
+  /** CSI packets per second accepted by capture validation. */
+  float csi_accepted_pps{0.0f};
+  /** CSI packets per second admitted to the detector's temporal grid. */
+  float csi_admitted_pps{0.0f};
+  /** CSI packets per second rejected by capture-level validation. */
+  float csi_filtered_pps{0.0f};
+  /** Hardware-quality rejections per second, with one reason per rejected callback. */
+  float csi_hw_error_pps{0.0f};
+  /** Valid CSI callbacks per second dropped because the pending queue was full. */
+  float csi_pending_frame_drop_pps{0.0f};
+  /** Missing detector slots per second. */
+  float csi_missing_slots_pps{0.0f};
+  /** Same-slot excess drops per second. */
+  float csi_excess_pps{0.0f};
+  /** Stale temporal drops per second. */
+  float csi_stale_pps{0.0f};
+  /** Out-of-order temporal drops per second. */
+  float csi_out_of_order_pps{0.0f};
+  /** Valid-slot occupancy of the active temporal detector window. */
+  float csi_occupancy_ratio{0.0f};
+  /** RSSI of the current association. `INT8_MIN` when unavailable. */
+  int8_t wifi_rssi_dbm{INT8_MIN};
+  /** Primary channel of the current association. Zero when unavailable. */
+  uint8_t wifi_channel{0U};
+};
+
+/**
+ * Converts cumulative diagnostics into rates over the interval between reads.
+ *
+ * Call `reset()` when the owning runtime starts. Counter resets are treated as
+ * a new epoch, so rearming a traffic source cannot underflow a rate. Station
+ * network counters wrap modulo 2^32 and are never reset by sensing restarts.
+ *
+ * @code
+ * // once, after controller.setup() succeeds:
+ * sampler.reset(controller.diagnostics(), now_ms);
+ * // on the runtime's existing sensing heartbeat:
+ * latest = sampler.sample(controller.diagnostics(), now_ms);
+ * @endcode
+ *
+ * @par Threading
+ * Not synchronized, and it holds the previous read. Sample it from the task
+ * that owns the runtime.
+ */
+class RuntimeDiagnosticsSampler {
+ public:
+  /**
+   * Establish the baseline the next `sample()` measures against.
+   *
+   * @param snapshot Current cumulative counters.
+   * @param now_ms Monotonic frontend clock, in milliseconds.
+   */
+  void reset(const RuntimeDiagnosticsSnapshot &snapshot, uint32_t now_ms);
+  /**
+   * Derive rates since the previous read and adopt this one as the baseline.
+   *
+   * The caller owns the window. Call it from an existing periodic sensing
+   * update, so diagnostics do not add a timer.
+   *
+   * @param snapshot Current cumulative counters.
+   * @param now_ms Monotonic frontend clock, in milliseconds.
+   * @return Rates over the elapsed interval. The link fields are always
+   *         carried through; the rates are zero when there is no baseline yet
+   *         or no time has elapsed.
+   */
+  RuntimeDiagnosticsSample sample(const RuntimeDiagnosticsSnapshot &snapshot, uint32_t now_ms);
+
+ private:
+  RuntimeDiagnosticsSnapshot previous_{};
+  uint32_t previous_ms_{0U};
+  bool baseline_ready_{false};
+};
+
+}  // namespace espectre

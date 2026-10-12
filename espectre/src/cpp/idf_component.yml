@@ -1,0 +1,43 @@
+version: "3.0.0"
+description: "ESPectre SDK for Wi-Fi motion detection on ESP32 devices."
+license: "GPL-3.0-only"
+url: "https://espectre.dev/"
+repository: "https://github.com/francescopace/espectre"
+documentation: "https://espectre.dev/sdk/"
+issues: "https://github.com/francescopace/espectre/issues"
+maintainers:
+  - "Francesco Pace <francesco.pace@espectre.dev>"
+tags:
+  - csi
+  - sensing
+  - motion-detection
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c5
+  - esp32c6
+files:
+  exclude:
+    - "frontend/**"
+    - "AGENTS.md"
+    - "Doxyfile"
+    - "sdk_integration.dox"
+    - "espectre_git_version.cmake"
+dependencies:
+  idf:
+    # ESP32-C5 LLTF capture requires lltf_bit_mode, introduced in 5.5.3.
+    version: ">=5.5.3"
+  espressif/mqtt:
+    version: "1.0.0"
+    registry_url: "https://components.espressif.com"
+    require: public
+    rules:
+      - if: "idf_version >=6.0.0"
+      - if: "$CONFIG{ESPECTRE_SDK_ENABLE_MQTT} == True"
+  espressif/mdns:
+    version: "1.12.0"
+    registry_url: "https://components.espressif.com"
+    rules:
+      - if: "$CONFIG{ESPECTRE_SDK_ENABLE_DIRECT} == True"

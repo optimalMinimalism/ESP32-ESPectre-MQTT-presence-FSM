@@ -1,0 +1,47 @@
+/*
+ * ESPectre - CSI Platform Configuration Helpers
+ *
+ * Selects and builds ESP-IDF CSI capture settings for the sensing pipeline.
+ *
+ * Author: Francesco Pace <francesco.pace@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Commercial licensing available under separate agreement; see LICENSING.md.
+ */
+#pragma once
+
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "runtime/csi_capture_profile.h"
+#include "sdkconfig.h"
+#include "wifi_csi_interface.h"
+
+namespace espectre {
+
+constexpr CsiCaptureProfile select_csi_capture_profile(uint8_t wifi_channel,
+                                                       bool requires_lltf = false,
+                                                       CsiCapturePolicy requested = CsiCapturePolicy::AUTO) {
+  if (requires_lltf && requested == CsiCapturePolicy::AUTO) return CsiCaptureProfile::LLTF20;
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && CONFIG_IDF_TARGET_ESP32C5
+  constexpr bool kSupportsVht20 = true;
+#else
+  constexpr bool kSupportsVht20 = false;
+#endif
+  return resolve_csi_capture_profile(false, kSupportsVht20,
+                                     wifi_channel, requested);
+}
+
+/** Whether this target can acquire the requested profile. */
+constexpr bool csi_capture_profile_supported(CsiCaptureProfile profile) {
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && CONFIG_IDF_TARGET_ESP32C5
+  return profile == CsiCaptureProfile::LLTF20 ||
+         profile == CsiCaptureProfile::HT20 || profile == CsiCaptureProfile::VHT20;
+#else
+  return profile == CsiCaptureProfile::LLTF20 ||
+         profile == CsiCaptureProfile::HT20;
+#endif
+}
+
+wifi_csi_config_t build_csi_config(CsiCaptureProfile profile);
+esp_err_t configure_csi(IWiFiCSI *wifi_csi, CsiCaptureProfile profile);
+
+}  // namespace espectre

@@ -1,0 +1,108 @@
+Espectre agreggator info (7/10):
+
+| Label | Role |
+| --- | --- |
+| `S3_A` | Doorway sensing path |
+| `S3_B` | Internal sensing path |
+| `S3_C` | Internal sensing path |
+| `S3_D` | Internal sensing path |
+
+BROKER_IP: 192.168.4.6/24 
+
+A)
+
+{
+  "apply_message": "Wi-Fi candidate verified and saved",
+  "apply_state": "applied",
+  "band": "2g",
+  "bssid": "80:B5:4E:E8:18:69",
+  "channel": 6,
+  "configured": true,
+  "connected": true,
+  "ip": "192.168.4.2",
+  "rssi_dbm": -51,
+  "ssid": "CSI-LAB-A"
+}
+{
+  "chip": "esp32s3",
+  "csi_profile": "lltf20",
+  "device_id": "4e1daff22535f426",
+  "firmware": "3.0.0-rc3-13-g47a36fd",
+  "frontend": "native",
+  "label": "",
+  "name": "ESPectre S3 35f426"
+}
+
+B)
+
+{
+  "apply_message": "Wi-Fi candidate verified and saved",
+  "apply_state": "applied",
+  "band": "2g",
+  "bssid": "80:B5:4E:E8:18:69",
+  "channel": 6,
+  "configured": true,
+  "connected": true,
+  "ip": "192.168.4.5",
+  "rssi_dbm": -34,
+  "ssid": "CSI-LAB-A"
+}
+
+{
+  "chip": "esp32s3",
+  "csi_profile": "ht20",
+  "device_id": "798da59369253ac3",
+  "firmware": "3.0.0-rc3-13-g47a36fd",
+  "frontend": "native",
+  "label": "",
+  "name": "ESPectre S3 253ac3"
+}
+
+C)
+{
+  "apply_message": "Wi-Fi candidate verified and saved",
+  "apply_state": "applied",
+  "band": "2g",
+  "bssid": "80:B5:4E:E8:18:69",
+  "channel": 6,
+  "configured": true,
+  "connected": true,
+  "ip": "192.168.4.6",
+  "rssi_dbm": -44,
+  "ssid": "CSI-LAB-A"
+}
+
+{
+  "chip": "esp32s3",
+  "csi_profile": "ht20",
+  "device_id": "e1e9c480cfcb7d5b",
+  "firmware": "3.0.0-rc3-13-g47a36fd",
+  "frontend": "native",
+  "label": "",
+  "name": "ESPectre S3 cb7d5b"
+}
+
+D)
+ct get wifi   --endpoint http://192.168.4.7:62587/espectre/v1
+{
+  "apply_message": "Wi-Fi candidate verified and saved",
+  "apply_state": "applied",
+  "band": "2g",
+  "bssid": "80:B5:4E:E8:18:69",
+  "channel": 6,
+  "configured": true,
+  "connected": true,
+  "ip": "192.168.4.7",
+  "rssi_dbm": -41,
+  "ssid": "CSI-LAB-A"
+}
+
+{
+  "chip": "esp32s3",
+  "csi_profile": "ht20",
+  "device_id": "3b094cd69596c343",
+  "firmware": "3.0.0-rc3-13-g47a36fd",
+  "frontend": "native",
+  "label": "",
+  "name": "ESPectre S3 96c343"
+}

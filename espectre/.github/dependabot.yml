@@ -1,0 +1,99 @@
+# Dependabot Configuration
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+#
+# Supported ecosystems:
+#   - pip: Python dependencies (includes ESPHome)
+#   - npm: Website build and browser dependencies
+#   - github-actions: Workflow action versions
+#
+# Not supported by Dependabot:
+#   - ESP-IDF Component Manager: idf_component.yml and dependencies.lock
+
+version: 2
+updates:
+  # Python dependencies (micro-espectre)
+  # Includes: numpy, scipy, matplotlib, pytest, paho-mqtt, etc.
+  - package-ecosystem: "pip"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(python)"
+    labels:
+      - "dependencies"
+      - "python"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    ignore:
+      # ESPHome pins these direct project dependencies to exact versions.
+      # Update their requirements.txt pins and review this list with each ESPHome upgrade.
+      # target-branch scopes these exclusions to version updates on develop.
+      - dependency-name: "aioesphomeapi"
+      - dependency-name: "click"
+      - dependency-name: "colorama"
+      - dependency-name: "cryptography"
+      - dependency-name: "esptool"
+      - dependency-name: "jinja2"
+      - dependency-name: "paho-mqtt"
+      - dependency-name: "pyserial"
+      - dependency-name: "pyyaml"
+      - dependency-name: "requests"
+      - dependency-name: "zeroconf"
+
+  # Website build and browser dependencies
+  - package-ecosystem: "npm"
+    directory: "/docs/web"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(web)"
+    labels:
+      - "dependencies"
+    groups:
+      web-dependencies:
+        patterns:
+          - "*"
+
+  # CI-only JavaScript quality tooling
+  - package-ecosystem: "npm"
+    directory: "/.github/quality"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(ci)"
+    labels:
+      - "dependencies"
+    groups:
+      quality-dependencies:
+        patterns:
+          - "*"
+
+  # GitHub Actions
+  # Monitors: actions/checkout, actions/setup-python, actions/upload-artifact, etc.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "develop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(ci)"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

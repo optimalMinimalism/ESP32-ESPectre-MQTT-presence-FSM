@@ -1,0 +1,884 @@
+/*
+ * ESPectre - Standalone Wi-Fi Service
+ *
+ * Starts and monitors the standalone station connection used by sensing
+ * frontends.
+ *
+ * Author: Francesco Pace <francesco.pace@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Commercial licensing available under separate agreement; see LICENSING.md.
+ */
+#include "standalone_wifi_service.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <utility>
+
+#include "core/espectre_log.h"
+#include "esp_netif.h"
+#include "esp_netif_ip_addr.h"
+#include "esp_wifi.h"
+#include "runtime/runtime_config_utils.h"
+#include "runtime/runtime_time.h"
+#include "wifi_band_helpers.h"
+
+namespace espectre {
+
+namespace {
+
+static const char *const TAG = "StandaloneWiFi";
+constexpr uint64_t DEFERRED_CONNECT_FALLBACK_DELAY_US = 1500000ULL;
+constexpr uint64_t RECONNECT_DELAY_US = 30000000ULL;
+constexpr uint16_t MAX_SCAN_ACCESS_POINTS = 32U;
+
+bool parse_bssid(const char *text, uint8_t out[6]) {
+  if (text == nullptr || out == nullptr || text[0] == '\0') {
+    return false;
+  }
+
+  unsigned int bytes[6] = {0U, 0U, 0U, 0U, 0U, 0U};
+  if (std::sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x", &bytes[0], &bytes[1], &bytes[2], &bytes[3], &bytes[4],
+                  &bytes[5]) != 6) {
+    return false;
+  }
+
+  for (size_t i = 0; i < 6; i++) {
+    out[i] = static_cast<uint8_t>(bytes[i]);
+  }
+  return true;
+}
+
+bool has_text(const char *text) { return text != nullptr && text[0] != '\0'; }
+
+bool station_credentials_fit(const StandaloneWifiConfig &config) {
+  wifi_config_t limits{};
+  return (config.ssid == nullptr || std::strlen(config.ssid) <= sizeof(limits.sta.ssid)) &&
+         (config.password == nullptr || std::strlen(config.password) <= sizeof(limits.sta.password));
+}
+
+std::string format_bssid(const uint8_t bssid[6]) {
+  char formatted[18]{};
+  std::snprintf(formatted,
+                sizeof(formatted),
+                "%02X:%02X:%02X:%02X:%02X:%02X",
+                bssid[0],
+                bssid[1],
+                bssid[2],
+                bssid[3],
+                bssid[4],
+                bssid[5]);
+  return formatted;
+}
+
+void format_ip_address(const esp_ip4_addr_t &ip, char *out, size_t out_size) {
+  if (out == nullptr || out_size == 0U) {
+    return;
+  }
+  out[0] = '\0';
+  if (ip.addr != 0U) {
+    esp_ip4addr_ntoa(&ip, out, static_cast<int>(out_size));
+  }
+}
+
+const char *wifi_disconnect_reason_to_str(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "beacon-timeout";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "no-ap-found";
+    case WIFI_REASON_AUTH_FAIL:
+      return "auth-fail";
+    case WIFI_REASON_ASSOC_FAIL:
+      return "assoc-fail";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "handshake-timeout";
+    case WIFI_REASON_CONNECTION_FAIL:
+      return "connection-fail";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+      return "no-ap-compatible-security";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+      return "no-ap-authmode-threshold";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+      return "no-ap-rssi-threshold";
+    default:
+      return "unknown";
+  }
+}
+
+}  // namespace
+
+StandaloneWifiService::~StandaloneWifiService() { shutdown(); }
+
+esp_err_t StandaloneWifiService::setup(const StandaloneWifiConfig &config,
+                                       standalone_wifi_callback_t connected_cb,
+                                       standalone_wifi_callback_t disconnected_cb) {
+  if (setup_complete_) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (!station_credentials_fit(config) || config.max_retry < 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  config_ = config;
+  if (!wifi_band_policy_is_supported(config_.band_policy)) {
+    ESPECTRE_LOGE(TAG, "Wi-Fi band policy is not supported by this target: %s",
+             wifi_band_policy_name(config_.band_policy));
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+  if (!wifi_channel_is_supported(config_.channel) ||
+      !wifi_channel_matches_band_policy(config_.channel, config_.band_policy)) {
+    ESPECTRE_LOGE(TAG, "Invalid Wi-Fi channel: %u (expected %s)",
+             static_cast<unsigned>(config_.channel),
+             wifi_channel_supported_description(config_.band_policy));
+    return ESP_ERR_INVALID_ARG;
+  }
+  connected_cb_ = connected_cb;
+  disconnected_cb_ = disconnected_cb;
+
+  esp_err_t err = esp_netif_init();
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = esp_event_loop_create_default();
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESPECTRE_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  station_netif_ = esp_netif_create_default_wifi_sta();
+  if (station_netif_ == nullptr) {
+    ESPECTRE_LOGE(TAG, "esp_netif_create_default_wifi_sta failed");
+    return ESP_FAIL;
+  }
+
+  const auto fail_setup = [this](esp_err_t error) {
+    shutdown();
+    return error;
+  };
+
+  wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+  err = esp_wifi_init(&wifi_cfg);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+    return fail_setup(err);
+  }
+  wifi_initialized_ = true;
+
+  err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
+    return fail_setup(err);
+  }
+
+  err = esp_wifi_set_mode(WIFI_MODE_STA);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
+    return fail_setup(err);
+  }
+
+  // Keep the CSI bootstrap deterministic: initialize
+  // the internal Wi-Fi CSI structures before the station starts associating.
+  err = esp_wifi_set_promiscuous(false);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_wifi_set_promiscuous failed: %s", esp_err_to_name(err));
+    return fail_setup(err);
+  }
+
+  if (config_.manage_csi_lifecycle) {
+    err = wifi_lifecycle_.register_handlers([this](const esp_netif_ip_info_t &ip_info) {
+                                              handle_lifecycle_connected_(ip_info);
+                                            },
+                                            [this]() { handle_lifecycle_disconnected_(); },
+                                            config_.band_policy);
+    if (err != ESP_OK) {
+      ESPECTRE_LOGE(TAG, "Wi-Fi lifecycle handler registration failed: %s", esp_err_to_name(err));
+      return fail_setup(err);
+    }
+  }
+
+  err = esp_event_handler_instance_register(WIFI_EVENT,
+                                            ESP_EVENT_ANY_ID,
+                                            &StandaloneWifiService::wifi_event_handler_,
+                                            this,
+                                            &wifi_event_instance_);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "Wi-Fi event handler registration failed: %s", esp_err_to_name(err));
+    return fail_setup(err);
+  }
+
+  err = esp_event_handler_instance_register(IP_EVENT,
+                                            IP_EVENT_STA_GOT_IP,
+                                            &StandaloneWifiService::wifi_event_handler_,
+                                            this,
+                                            &ip_event_instance_);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "IP event handler registration failed: %s", esp_err_to_name(err));
+    return fail_setup(err);
+  }
+
+  err = configure_station_();
+  if (err != ESP_OK) {
+    return fail_setup(err);
+  }
+
+  setup_complete_ = true;
+  return ESP_OK;
+}
+
+bool StandaloneWifiService::get_info(StandaloneWifiInfo *info) const {
+  if (info == nullptr) {
+    return false;
+  }
+
+  *info = StandaloneWifiInfo{};
+
+  uint8_t mac[6] = {0};
+  if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+    std::snprintf(info->mac_address,
+                  sizeof(info->mac_address),
+                  "%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0],
+                  mac[1],
+                  mac[2],
+                  mac[3],
+                  mac[4],
+                  mac[5]);
+  }
+
+  if (cached_ip_info_.ip.addr != 0U) {
+    // esp_wifi_sta_get_ap_info() logs a warning whenever the station is not
+    // associated. Improv polls this accessor from the 10 ms runtime loop, so
+    // querying before IPv4 is ready floods the provisioning console and can
+    // starve its binary protocol. The cached address is cleared on disconnect
+    // and restored only after GOT_IP or a verified association retaining IPv4.
+    wifi_ap_record_t ap_info{};
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+      info->connected = true;
+      info->channel = ap_info.primary;
+    }
+    format_ip_address(cached_ip_info_.ip, info->ip_address, sizeof(info->ip_address));
+  }
+
+  return info->connected || info->ip_address[0] != '\0' || info->mac_address[0] != '\0';
+}
+
+esp_err_t StandaloneWifiService::configure_station_() {
+  wifi_config_t sta_cfg{};
+  if (!station_credentials_fit(config_)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (config_.ssid != nullptr) {
+    std::memcpy(sta_cfg.sta.ssid, config_.ssid, std::strlen(config_.ssid));
+  }
+  if (config_.password != nullptr) {
+    std::memcpy(sta_cfg.sta.password, config_.password, std::strlen(config_.password));
+  }
+  sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+  sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+  sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+  sta_cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+  sta_cfg.sta.pmf_cfg.capable = true;
+  sta_cfg.sta.pmf_cfg.required = false;
+
+  if (config_.channel > 0U) {
+    sta_cfg.sta.channel = config_.channel;
+  }
+
+  if (has_text(config_.bssid)) {
+    if (!parse_bssid(config_.bssid, sta_cfg.sta.bssid)) {
+      ESPECTRE_LOGE(TAG, "Invalid BSSID format: %s", config_.bssid);
+      return ESP_ERR_INVALID_ARG;
+    }
+    sta_cfg.sta.bssid_set = true;
+    sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
+    if (sta_cfg.sta.channel != 0U) {
+      ESPECTRE_LOGI(TAG,
+               "Wi-Fi fast scan enabled: BSSID=%s channel=%u",
+               config_.bssid,
+               static_cast<unsigned>(sta_cfg.sta.channel));
+    } else {
+      ESPECTRE_LOGI(TAG, "Wi-Fi fast scan enabled: BSSID=%s channel=auto", config_.bssid);
+    }
+  } else if (sta_cfg.sta.channel != 0U) {
+    ESPECTRE_LOGI(TAG, "Wi-Fi channel hint enabled: channel=%u", static_cast<unsigned>(sta_cfg.sta.channel));
+  } else {
+    ESPECTRE_LOGI(TAG, "Wi-Fi full scan enabled: selecting strongest matching AP");
+  }
+
+  const esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+  if (err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+esp_err_t StandaloneWifiService::start() {
+  if (!setup_complete_) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  roaming_ = false;
+  retained_ip_pending_ = false;
+  clear_cached_ip_info_();
+  wifi_connect_requested_ = false;
+  defer_connect_once_after_start_ = true;
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+  reconnect_deadline_us_ = 0U;
+  wifi_retry_count_ = 0;
+  station_reconfigure_pending_ = false;
+  station_disconnect_pending_ = false;
+  const esp_err_t err = esp_wifi_start();
+  wifi_started_ = err == ESP_OK;
+  return err;
+}
+
+void StandaloneWifiService::loop() {
+  PendingWifiEvent event;
+  while (pending_events_.take(event)) {
+    switch (event.type) {
+      case PendingWifiEventType::STARTED:
+        wifi_started_ = true;
+        handle_wifi_started_();
+        break;
+      case PendingWifiEventType::STOPPED:
+        wifi_started_ = false;
+        handle_wifi_stopped_();
+        break;
+      case PendingWifiEventType::DISCONNECTED:
+        handle_wifi_disconnected_(event.disconnect_reason);
+        if (!config_.manage_csi_lifecycle && disconnected_cb_) {
+          disconnected_cb_();
+        }
+        break;
+      case PendingWifiEventType::ASSOCIATED:
+        if (!config_.manage_csi_lifecycle) {
+          handle_wifi_associated_();
+        }
+        break;
+      case PendingWifiEventType::GOT_IP:
+        if (!config_.manage_csi_lifecycle) {
+          handle_lifecycle_connected_(event.ip_info);
+        }
+        break;
+      case PendingWifiEventType::SCAN_DONE:
+        handle_scan_done_(event.scan_status);
+        break;
+    }
+  }
+  if (config_.manage_csi_lifecycle) {
+    (void)wifi_lifecycle_.process_pending_events();
+  } else {
+    maybe_restore_retained_ip_();
+  }
+  service_deferred_radio_work_();
+  maybe_run_deferred_connect_fallback_();
+  maybe_retry_connect_();
+}
+
+bool StandaloneWifiService::traffic_blocks_radio_() const {
+  return static_cast<bool>(radio_work_ready_callback_) && !radio_work_ready_callback_();
+}
+
+void StandaloneWifiService::service_deferred_radio_work_() {
+  if (!deferred_station_update_ && !deferred_scan_) {
+    return;
+  }
+  if (traffic_blocks_radio_()) {
+    return;
+  }
+  if (deferred_station_update_) {
+    deferred_station_update_ = false;
+    (void) commit_station_update_(deferred_station_connection_was_active_);
+    return;
+  }
+  deferred_scan_ = false;
+  const esp_err_t err = start_pending_scan_();
+  if (err != ESP_OK) {
+    scan_pending_ = false;
+    if (scan_callback_) {
+      const standalone_wifi_scan_callback_t callback = std::move(scan_callback_);
+      scan_callback_ = {};
+      callback(err, {});
+    }
+  }
+}
+
+esp_err_t StandaloneWifiService::request_scan(standalone_wifi_scan_callback_t callback) {
+  if (!setup_complete_ || !wifi_started_) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (scan_pending_ || WiFiLifecycleManager::csi_receive_path_refresh_active()) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!has_text(config_.ssid)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  scan_callback_ = std::move(callback);
+  scan_pending_ = true;
+  if (traffic_blocks_radio_()) {
+    deferred_scan_ = true;
+    return ESP_OK;
+  }
+  const esp_err_t err = start_pending_scan_();
+  if (err != ESP_OK) {
+    scan_pending_ = false;
+    scan_callback_ = {};
+  }
+  return err;
+}
+
+esp_err_t StandaloneWifiService::start_pending_scan_() {
+  if (!has_text(config_.ssid)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  const auto *ssid_begin = reinterpret_cast<const uint8_t *>(config_.ssid);
+  std::vector<uint8_t> scan_ssid(ssid_begin, ssid_begin + std::strlen(config_.ssid));
+  scan_ssid.push_back(0U);
+  wifi_scan_config_t scan{};
+  scan.ssid = scan_ssid.data();
+  // Keep channel zero so the driver searches every channel and band for BSSIDs
+  // that advertise the configured SSID.
+  return esp_wifi_scan_start(&scan, false);
+}
+
+esp_err_t StandaloneWifiService::update_station_config(const StandaloneWifiConfig &config) {
+  if (!setup_complete_) {
+    ESPECTRE_LOGE(TAG, "Cannot update Wi-Fi station config before setup");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!station_credentials_fit(config) || config.max_retry < 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (!wifi_band_policy_is_supported(config.band_policy)) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+  if (!wifi_channel_is_supported(config.channel) ||
+      !wifi_channel_matches_band_policy(config.channel, config.band_policy)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  // The lifecycle handler captures this policy during setup. A live band
+  // change would require re-registering the handler before reconnecting.
+  if (config.band_policy != config_.band_policy) {
+    ESPECTRE_LOGE(TAG, "Cannot change the Wi-Fi band policy without restarting the Wi-Fi service");
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (station_reconfigure_pending_ || deferred_station_update_) {
+    ESPECTRE_LOGW(TAG, "Wi-Fi station reconfigure is already pending");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  const bool station_connection_active =
+      wifi_connect_requested_ || cached_ip_info_.ip.addr != 0U;
+  config_ = config;
+  roaming_ = false;
+  retained_ip_pending_ = false;
+  reconnect_deadline_us_ = 0U;
+  clear_cached_ip_info_();
+  wifi_retry_count_ = 0;
+  wifi_connect_requested_ = false;
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+
+  if (traffic_blocks_radio_()) {
+    deferred_station_update_ = true;
+    deferred_station_connection_was_active_ = station_connection_active;
+    return ESP_OK;
+  }
+  return commit_station_update_(station_connection_active);
+}
+
+esp_err_t StandaloneWifiService::commit_station_update_(bool station_connection_active) {
+  if (!wifi_started_) {
+    return configure_station_();
+  }
+  if (!station_connection_active) {
+    return apply_station_config_and_connect_();
+  }
+
+  station_reconfigure_pending_ = true;
+  station_disconnect_pending_ = true;
+  const esp_err_t disconnect_err = esp_wifi_disconnect();
+  if (disconnect_err == ESP_OK) {
+    ESPECTRE_LOGI(TAG, "Wi-Fi driver reconfigure requested; waiting for clean disconnect");
+    return ESP_OK;
+  }
+
+  // The connection latch can remain set while association has already been
+  // lost. In that case there is no peer state to tear down, so continue with
+  // the driver stop instead of abandoning the requested reconfiguration.
+  ESPECTRE_LOGW(TAG, "esp_wifi_disconnect before driver reconfigure failed: %s; stopping directly",
+                esp_err_to_name(disconnect_err));
+  station_disconnect_pending_ = false;
+  return stop_wifi_for_driver_reconfigure_();
+}
+
+esp_err_t StandaloneWifiService::apply_station_config_and_connect_() {
+  station_reconfigure_pending_ = false;
+  const esp_err_t config_err = configure_station_();
+  if (config_err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "Wi-Fi station reconfigure failed: %s",
+                  esp_err_to_name(config_err));
+    return config_err;
+  }
+
+  if (!has_text(config_.ssid)) {
+    ESPECTRE_LOGW(TAG, "Wi-Fi SSID is empty; station config updated without reconnecting");
+    return ESP_OK;
+  }
+
+  const esp_err_t connect_err = connect_station_();
+  if (connect_err != ESP_OK) {
+    wifi_connect_requested_ = false;
+    ESPECTRE_LOGE(TAG, "esp_wifi_connect after reconfigure failed: %s",
+                  esp_err_to_name(connect_err));
+    return connect_err;
+  }
+  ESPECTRE_LOGI(TAG, "Wi-Fi station config updated; reconnecting");
+  return ESP_OK;
+}
+
+esp_err_t StandaloneWifiService::stop_wifi_for_driver_reconfigure_() {
+  const esp_err_t err = esp_wifi_stop();
+  if (err != ESP_OK) {
+    station_reconfigure_pending_ = false;
+    ESPECTRE_LOGE(TAG, "esp_wifi_stop before driver reconfigure failed: %s", esp_err_to_name(err));
+    return err;
+  }
+  ESPECTRE_LOGI(TAG, "Wi-Fi station disconnected; waiting for driver stop");
+  return ESP_OK;
+}
+
+esp_err_t StandaloneWifiService::restart_wifi_driver_() {
+  esp_err_t err =
+      WiFiLifecycleManager::reinitialize_stopped_station_driver(WIFI_STORAGE_RAM);
+  if (err == ESP_OK) err = configure_station_();
+  if (err != ESP_OK) {
+    station_reconfigure_pending_ = false;
+    ESPECTRE_LOGE(TAG, "Wi-Fi driver reinitialization failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  station_reconfigure_pending_ = false;
+  station_disconnect_pending_ = false;
+  wifi_connect_requested_ = false;
+  defer_connect_once_after_start_ = false;
+  const esp_err_t start_err = esp_wifi_start();
+  wifi_started_ = start_err == ESP_OK;
+  if (start_err != ESP_OK) {
+    ESPECTRE_LOGE(TAG, "esp_wifi_start after driver reconfigure failed: %s",
+                  esp_err_to_name(start_err));
+  }
+  return start_err;
+}
+
+void StandaloneWifiService::shutdown() {
+  if (wifi_started_) {
+    const esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK) {
+      ESPECTRE_LOGW(TAG, "esp_wifi_stop failed during shutdown: %s", esp_err_to_name(err));
+    }
+    wifi_started_ = false;
+  }
+  if (wifi_event_instance_ != nullptr) {
+    esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_instance_);
+    wifi_event_instance_ = nullptr;
+  }
+  if (ip_event_instance_ != nullptr) {
+    esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_event_instance_);
+    ip_event_instance_ = nullptr;
+  }
+  if (config_.manage_csi_lifecycle) {
+    wifi_lifecycle_.unregister_handlers();
+  }
+  if (wifi_initialized_) {
+    const esp_err_t err = esp_wifi_deinit();
+    if (err != ESP_OK) {
+      ESPECTRE_LOGW(TAG, "esp_wifi_deinit failed during shutdown: %s", esp_err_to_name(err));
+    }
+    wifi_initialized_ = false;
+  }
+  if (station_netif_ != nullptr) {
+    esp_netif_destroy_default_wifi(station_netif_);
+    station_netif_ = nullptr;
+  }
+  setup_complete_ = false;
+  station_reconfigure_pending_ = false;
+  station_disconnect_pending_ = false;
+  roaming_ = false;
+  retained_ip_pending_ = false;
+  scan_pending_ = false;
+  scan_callback_ = {};
+  pending_events_.clear();
+  wifi_connect_requested_ = false;
+  defer_connect_once_after_start_ = false;
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+  reconnect_deadline_us_ = 0U;
+  clear_cached_ip_info_();
+}
+
+void StandaloneWifiService::handle_wifi_started_() {
+  if (!has_text(config_.ssid)) {
+    ESPECTRE_LOGW(TAG, "Wi-Fi SSID is empty; configure credentials in sdkconfig.wifi or at build time");
+    return;
+  }
+
+  // When this service does not own the CSI lifecycle handlers, EspIdfRuntime may
+  // register its STA_START policy handler after ours. Apply the radio policy
+  // here before associating so set_protocol cannot abort an in-flight connect.
+  if (!config_.manage_csi_lifecycle) {
+    const esp_err_t policy_err = WiFiLifecycleManager::apply_started_csi_policy(config_.band_policy);
+    if (policy_err != ESP_OK) {
+      ESPECTRE_LOGW(TAG, "Failed to apply CSI Wi-Fi policy before connect: %s", esp_err_to_name(policy_err));
+    }
+  }
+
+  if (!wifi_connect_requested_) {
+    wifi_connect_requested_ = true;
+    if (defer_connect_once_after_start_) {
+      defer_connect_once_after_start_ = false;
+      deferred_connect_fallback_pending_ = true;
+      deferred_connect_fallback_deadline_us_ = monotonic_now_us() + DEFERRED_CONNECT_FALLBACK_DELAY_US;
+      ESPECTRE_LOGI(TAG, "STA start observed; deferring first explicit connect request");
+      return;
+    }
+    deferred_connect_fallback_pending_ = false;
+    deferred_connect_fallback_deadline_us_ = 0U;
+    (void)connect_station_();
+  }
+}
+
+void StandaloneWifiService::handle_wifi_stopped_() {
+  // Protocol or bandwidth changes can stop and restart STA
+  // after an earlier connect request. Clear the latch so the next STA_START
+  // associates again instead of leaving the radio idle.
+  wifi_connect_requested_ = false;
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+  reconnect_deadline_us_ = 0U;
+  roaming_ = false;
+  retained_ip_pending_ = false;
+  clear_cached_ip_info_();
+  if (station_reconfigure_pending_) {
+    (void)restart_wifi_driver_();
+  }
+}
+
+void StandaloneWifiService::handle_wifi_disconnected_(uint8_t reason) {
+  ESPECTRE_LOGW(TAG,
+           "Wi-Fi disconnected: reason=%u (%s)",
+           static_cast<unsigned>(reason),
+           wifi_disconnect_reason_to_str(reason));
+  const bool driver_roaming = reason == WIFI_REASON_ROAMING && !station_reconfigure_pending_;
+  roaming_ = driver_roaming && (cached_ip_info_.ip.addr != 0U || roaming_ || retained_ip_pending_);
+  retained_ip_pending_ = false;
+  clear_cached_ip_info_();
+  wifi_connect_requested_ = false;
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+  if (station_reconfigure_pending_) {
+    if (station_disconnect_pending_) {
+      station_disconnect_pending_ = false;
+      (void)apply_station_config_and_connect_();
+    }
+    return;
+  }
+  if (driver_roaming) {
+    // The driver owns this reassociation and can retain IPv4 without GOT_IP.
+    // A competing connect request can interrupt that transition.
+    reconnect_deadline_us_ = 0U;
+    return;
+  }
+  if (has_text(config_.ssid)) {
+    if (wifi_retry_count_ < config_.max_retry) {
+      wifi_retry_count_++;
+      (void)connect_station_();
+    } else {
+      reconnect_deadline_us_ = monotonic_now_us() + RECONNECT_DELAY_US;
+    }
+  }
+}
+
+void StandaloneWifiService::handle_wifi_associated_() {
+  retained_ip_pending_ = cached_ip_info_.ip.addr != 0U || roaming_ || retained_ip_pending_;
+  if (cached_ip_info_.ip.addr != 0U) {
+    clear_cached_ip_info_();
+    if (disconnected_cb_) disconnected_cb_();
+  }
+}
+
+void StandaloneWifiService::maybe_restore_retained_ip_() {
+  if (!retained_ip_pending_) return;
+
+  esp_netif_ip_info_t ip_info{};
+  wifi_ap_record_t access_point{};
+  if (station_netif_ == nullptr || esp_netif_get_ip_info(station_netif_, &ip_info) != ESP_OK ||
+      ip_info.ip.addr == 0U || esp_wifi_sta_get_ap_info(&access_point) != ESP_OK) {
+    return;
+  }
+  handle_lifecycle_connected_(ip_info);
+}
+
+void StandaloneWifiService::handle_lifecycle_connected_(const esp_netif_ip_info_t &ip_info) {
+  const bool duplicate = cached_ip_info_.ip.addr != 0U &&
+      cached_ip_info_.ip.addr == ip_info.ip.addr &&
+      cached_ip_info_.netmask.addr == ip_info.netmask.addr &&
+      cached_ip_info_.gw.addr == ip_info.gw.addr;
+  cached_ip_info_ = ip_info;
+  roaming_ = false;
+  retained_ip_pending_ = false;
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+  reconnect_deadline_us_ = 0U;
+  wifi_retry_count_ = 0;
+  if (!duplicate && connected_cb_) {
+    connected_cb_();
+  }
+}
+
+void StandaloneWifiService::handle_lifecycle_disconnected_() {
+  clear_cached_ip_info_();
+  if (disconnected_cb_) {
+    disconnected_cb_();
+  }
+}
+
+void StandaloneWifiService::handle_scan_done_(uint8_t status) {
+  if (!scan_pending_) {
+    return;
+  }
+
+  std::vector<StandaloneWifiAccessPoint> access_points;
+  esp_err_t result = status == 0U ? ESP_OK : ESP_FAIL;
+  uint16_t count = 0U;
+  if (result == ESP_OK) {
+    result = esp_wifi_scan_get_ap_num(&count);
+  }
+  count = std::min(count, MAX_SCAN_ACCESS_POINTS);
+  if (result == ESP_OK && count > 0U) {
+    std::vector<wifi_ap_record_t> records(count);
+    result = esp_wifi_scan_get_ap_records(&count, records.data());
+    if (result == ESP_OK) {
+      access_points.reserve(count);
+      for (uint16_t index = 0U; index < count; ++index) {
+        const wifi_ap_record_t &record = records[index];
+        access_points.push_back(StandaloneWifiAccessPoint{
+            reinterpret_cast<const char *>(record.ssid),
+            format_bssid(record.bssid),
+            record.rssi,
+            record.primary,
+        });
+      }
+      std::sort(access_points.begin(),
+                access_points.end(),
+                [](const StandaloneWifiAccessPoint &left, const StandaloneWifiAccessPoint &right) {
+                  if (left.rssi_dbm != right.rssi_dbm) return left.rssi_dbm > right.rssi_dbm;
+                  return left.bssid < right.bssid;
+                });
+    }
+  }
+
+  scan_pending_ = false;
+  standalone_wifi_scan_callback_t callback = std::move(scan_callback_);
+  scan_callback_ = {};
+  if (callback) {
+    callback(result, access_points);
+  }
+}
+
+void StandaloneWifiService::maybe_run_deferred_connect_fallback_() {
+  if (!deferred_connect_fallback_pending_ || !wifi_started_ || !has_text(config_.ssid)) {
+    return;
+  }
+  if (cached_ip_info_.ip.addr != 0U) {
+    deferred_connect_fallback_pending_ = false;
+    deferred_connect_fallback_deadline_us_ = 0U;
+    return;
+  }
+
+  const uint64_t now_us = monotonic_now_us();
+  if (now_us < deferred_connect_fallback_deadline_us_) {
+    return;
+  }
+
+  deferred_connect_fallback_pending_ = false;
+  deferred_connect_fallback_deadline_us_ = 0U;
+  ESPECTRE_LOGI(TAG, "Deferred STA-start connect fallback expired; issuing one explicit connect");
+  const esp_err_t err = connect_station_();
+  if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+    ESPECTRE_LOGE(TAG, "Deferred esp_wifi_connect fallback failed: %s", esp_err_to_name(err));
+    wifi_connect_requested_ = false;
+  }
+}
+
+esp_err_t StandaloneWifiService::connect_station_() {
+  wifi_connect_requested_ = true;
+  reconnect_deadline_us_ = 0U;
+  const esp_err_t err = esp_wifi_connect();
+  if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+    wifi_connect_requested_ = false;
+    reconnect_deadline_us_ = monotonic_now_us() + RECONNECT_DELAY_US;
+  }
+  return err;
+}
+
+void StandaloneWifiService::maybe_retry_connect_() {
+  if (reconnect_deadline_us_ == 0U || !wifi_started_ || wifi_connect_requested_ ||
+      station_reconfigure_pending_ || scan_pending_ || !has_text(config_.ssid) ||
+      monotonic_now_us() < reconnect_deadline_us_) {
+    return;
+  }
+  wifi_retry_count_ = 0;
+  (void)connect_station_();
+}
+
+void StandaloneWifiService::clear_cached_ip_info_() { cached_ip_info_ = {}; }
+
+void StandaloneWifiService::wifi_event_handler_(void *arg, esp_event_base_t event_base, int32_t event_id,
+                                                void *event_data) {
+  auto *service = static_cast<StandaloneWifiService *>(arg);
+  if (service == nullptr || event_base == nullptr) {
+    return;
+  }
+
+  PendingWifiEvent pending;
+  if (std::strcmp(event_base, WIFI_EVENT) == 0) {
+    if (event_id == WIFI_EVENT_STA_START) {
+      pending.type = PendingWifiEventType::STARTED;
+    } else if (event_id == WIFI_EVENT_STA_STOP) {
+      pending.type = PendingWifiEventType::STOPPED;
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+      pending.type = PendingWifiEventType::DISCONNECTED;
+      const auto *event = static_cast<const wifi_event_sta_disconnected_t *>(event_data);
+      pending.disconnect_reason = event != nullptr ? event->reason : 0U;
+    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+      pending.type = PendingWifiEventType::ASSOCIATED;
+    } else if (event_id == WIFI_EVENT_SCAN_DONE) {
+      pending.type = PendingWifiEventType::SCAN_DONE;
+      const auto *event = static_cast<const wifi_event_sta_scan_done_t *>(event_data);
+      pending.scan_status = event != nullptr ? event->status : 0U;
+    } else {
+      return;
+    }
+  } else if (std::strcmp(event_base, IP_EVENT) == 0 && event_id == IP_EVENT_STA_GOT_IP) {
+    pending.type = PendingWifiEventType::GOT_IP;
+    const auto *event = static_cast<const ip_event_got_ip_t *>(event_data);
+    if (event != nullptr) {
+      pending.ip_info = event->ip_info;
+    }
+  } else {
+    return;
+  }
+
+  if (!service->pending_events_.post(pending)) {
+    service->dropped_events_.fetch_add(1U, std::memory_order_relaxed);
+  }
+}
+
+}  // namespace espectre

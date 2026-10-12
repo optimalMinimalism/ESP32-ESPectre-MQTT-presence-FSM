@@ -1,0 +1,81 @@
+<!--
+  SPDX-License-Identifier: GPL-3.0-only
+  Commercial licensing available under separate agreement; see LICENSING.md.
+-->
+<article class="article guide-article" data-page-toc data-page-path="guides">
+  <span class="guide-tag">MICROPYTHON · 3 MIN READ</span>
+  <h1>Run ESPectre on MicroPython</h1>
+  <p class="article-lead">Capture Wi-Fi CSI and detect motion in MicroPython, using the CSI support that ESPectre added to MicroPython itself.</p>
+  <figure>
+    <img src="/assets/images/guides/micropython-csi-runtime-card.avif" alt="A Python snake mascot perched on an Espressif board connected to a laptop displaying CSI traces" width="1068" height="600" loading="eager">
+    <figcaption>MicroPython captures CSI on the ESP32. The native Lightweight detector turns those measurements into motion.</figcaption>
+  </figure>
+
+  <details class="page-toc">
+    <summary>Sections</summary>
+    <nav aria-label="Guide sections"><strong>On this page</strong><a href="#micropython-upstream">Upstream CSI support</a><a href="#micropython-runtime">On-device runtime</a><a href="#micropython-requirements">Requirements</a><a href="#micropython-cli">CLI workflow</a><a href="#micropython-profiles">Detector</a><a href="#micropython-boundary">Current limits</a></nav>
+  </details>
+
+  <h2 id="micropython-upstream">ESPectre brought ESP32 CSI to mainline MicroPython</h2>
+  <p>ESPectre added Wi-Fi CSI access to MicroPython in <a href="https://github.com/micropython/micropython/pull/18460" target="_blank" rel="noopener">micropython/micropython#18460</a>. New ESP32 <code>network.WLAN</code> methods let Python code capture CSI, read it from a buffer, and count dropped frames.</p>
+  <p>The change was merged for MicroPython 1.29.0, so any MicroPython project can now use CSI on the ESP32. Micro-ESPectre builds on an official MicroPython version instead of the old CSI fork.</p>
+
+  <h2 id="micropython-runtime">What runs on the ESP32</h2>
+  <p>The device loop runs in MicroPython on the board. CSI capture uses MicroPython. Filtering, Lightweight detection, traffic generation, and HTTP delivery use native components from the C++ SDK. The device reports motion and a movement score; it does not send raw CSI.</p>
+  <div class="pipeline">
+    <div><strong>Wi-Fi traffic</strong><span>router</span></div>
+    <div><strong>CSI capture</strong><span>MicroPython</span></div>
+    <div><strong>Features</strong><span>native SDK</span></div>
+    <div><strong>Detection</strong><span>native Lightweight</span></div>
+    <div><strong>Direct SSE</strong><span>local network</span></div>
+  </div>
+  <p>Detector changes are tried in host-side Python first, then ported into the shared C++ code that the device runs. Messages use the same protocol as the other firmware types.</p>
+
+  <h2 id="micropython-requirements">Requirements</h2>
+  <div class="table-wrap"><table>
+    <caption class="sr-only">Requirements for running Micro-ESPectre</caption>
+    <thead><tr><th scope="col">Requirement</th><th scope="col">Current support</th></tr></thead>
+    <tbody>
+      <tr><td>Board</td><td>ESP32, ESP32-S2, ESP32-S3, ESP32-C3, ESP32-C5, or ESP32-C6.</td></tr>
+      <tr><td>Radio</td><td>Steady Wi-Fi traffic on 2.4&nbsp;GHz. ESP32-C5 also captures a 5&nbsp;GHz link as <code>vht20</code>. Detection quality on 5&nbsp;GHz is not measured yet.</td></tr>
+      <tr><td>Firmware</td><td>The ESPectre MicroPython image, built from an official MicroPython version</td></tr>
+      <tr><td>Host setup</td><td>The ESPectre repository and its <code>./espectre</code> command</td></tr>
+      <tr><td>Monitoring</td><td>A browser or client on the same local network</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2 id="micropython-cli">CLI workflow</h2>
+  <p>The <code>./espectre</code> command builds and flashes MicroPython, then copies Micro-ESPectre to the board and checks it.</p>
+  <ol class="steps-list">
+    <li><h3>Prepare the repository</h3><p>Create a Python virtual environment and install the requirements.</p></li>
+    <li><h3>Build and flash MicroPython</h3><p>Choose your chip. The command builds the MicroPython image and installs it over USB.</p></li>
+    <li><h3>Copy and run Micro-ESPectre</h3><p>Create your local configuration from the example, then copy Micro-ESPectre to the device and start it.</p></li>
+  </ol>
+  <pre class="code"><code>python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+
+cp src/python/micro_espectre/config_local.py.example \
+  src/python/micro_espectre/config_local.py
+
+./espectre micro flash --chip c3 --erase
+./espectre micro deploy
+./espectre micro verify
+./espectre micro run</code></pre>
+  <div class="note">Keep Wi-Fi credentials in <code>config_local.py</code>. Never commit that local file.</div>
+
+  <h2 id="micropython-profiles">Lightweight sensing</h2>
+  <p>Micro-ESPectre runs only the Lightweight detector, which calibrates its threshold at startup while the room is quiet. The High Accuracy code stays in the repository for research and testing, but is not copied to the device.</p>
+  <p>Over Direct HTTP, Micro-ESPectre provides <code>health</code>, <code>device</code>, <code>capabilities</code>, <code>sensing</code>, <code>wifi</code>, and <code>diagnostics</code>. Its only action is recalibration, and its <code>events</code> stream sends motion updates only. It also prints its status on the serial port every second. It publishes its DNS-SD service, so <code>./espectre devices --frontend micro</code> can list it. Browser Auto-discovery still needs a Native, ESPHome, or commissioned Matter device on the LAN: Micro does not answer the bootstrap name or <code>GET /devices</code>. It has no MQTT, raw CSI stream, or Home Assistant support.</p>
+
+  <h2 id="micropython-boundary">Current role and limits</h2>
+  <p>Micro-ESPectre is where we experiment in Python. It is not a stable library yet: you install the whole application, and its public interface may still change.</p>
+  <ul class="checklist">
+    <li>Only the Lightweight detector is available.</li>
+    <li>Settings are read-only while running; to change them, edit the files and deploy again.</li>
+    <li>No Bluetooth setup and no over-the-air updates.</li>
+    <li>Changes reach the production firmware only after they are ported to C++ and tested to give the same results.</li>
+  </ul>
+  <p>For configuration, the Direct API, and development checks, see the <a href="https://github.com/francescopace/espectre/blob/main/src/python/micro_espectre/README.md" target="_blank" rel="noopener">Micro-ESPectre reference</a>.</p>
+
+</article>

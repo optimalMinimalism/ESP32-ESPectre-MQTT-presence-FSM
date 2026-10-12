@@ -1,0 +1,771 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Preserve publication sources; dispatched snapshots recheck whether the commit is current.
+  cancel-in-progress: ${{ github.event_name != 'push' || (github.ref_type != 'tag' && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop') }}
+
+jobs:
+  # Run preparation and the host-side checks as one parallel stage.
+  prepare:
+    name: Prepare Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      publication: ${{ steps.metadata.outputs.publication }}
+      version: ${{ steps.metadata.outputs.version }}
+      channel: ${{ steps.metadata.outputs.channel }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      artifact_suffix: ${{ steps.metadata.outputs.artifact_suffix }}
+      ota_channel: ${{ steps.metadata.outputs.ota_channel }}
+      sign: ${{ steps.metadata.outputs.sign }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Select publication and validate release metadata
+        id: metadata
+        env:
+          PUSH_DELETED: ${{ github.event.deleted || false }}
+        run: |
+          publication=none
+          version="$(python3 .github/scripts/detect_git_version.py)"
+          channel=preview
+          release_tag=ci
+          artifact_suffix=ci
+          ota_channel=release
+          sign=false
+          if [[ "$GITHUB_EVENT_NAME" == push && "$PUSH_DELETED" != true ]]; then
+            if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+($|-) ]]; then
+              git fetch --no-tags origin main
+              git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+                || { echo "Release commit is not reachable from main." >&2; exit 1; }
+              python3 .github/scripts/validate_release.py --tag "$GITHUB_REF_NAME"
+              publication=release
+              version="$GITHUB_REF_NAME"
+              channel=release
+              release_tag="$GITHUB_REF_NAME"
+              artifact_suffix="$GITHUB_REF_NAME"
+              sign=true
+            elif [[ "$GITHUB_REF" == refs/heads/main || "$GITHUB_REF" == refs/heads/develop ]]; then
+              publication=snapshot
+              channel=preview
+              release_tag=snapshot
+              if [[ "$GITHUB_REF" == refs/heads/develop ]]; then
+                channel=develop
+                release_tag=snapshot-dev
+              fi
+              artifact_suffix="$channel"
+              ota_channel="$channel"
+              sign=true
+            fi
+          fi
+          {
+            echo "publication=$publication"
+            echo "version=$version"
+            echo "channel=$channel"
+            echo "release_tag=$release_tag"
+            echo "artifact_suffix=$artifact_suffix"
+            echo "ota_channel=$ota_channel"
+            echo "sign=$sign"
+          } >> "$GITHUB_OUTPUT"
+
+  build-site:
+    name: Website Unit Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/web/package-lock.json
+
+      - name: Audit website dependencies
+        run: npm --prefix docs/web audit --package-lock-only --include=dev --audit-level=low
+      
+      - name: Build and verify Pages tree
+        uses: ./.github/actions/build-pages
+        env:
+          WEB_COVERAGE_LOG: .cache/reports/coverage/web-coverage.log
+
+      - name: Build web coverage badge
+        if: always() && hashFiles('.cache/reports/coverage/web-coverage.log') != ''
+        run: |
+          python .github/scripts/build_coverage_badges.py \
+            --kind web \
+            --report .cache/reports/coverage/web-coverage.log \
+            --thresholds test/web/coverage-thresholds.json \
+            --output .cache/reports/coverage/coverage-web.json
+
+      - name: Upload web coverage badge
+        if: always() && hashFiles('.cache/reports/coverage/coverage-web.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: web-coverage-badge
+          path: .cache/reports/coverage/coverage-web.json
+          retention-days: 14
+
+  test-cpp:
+    name: C++ Unit Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+      
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run Host-side Tests with Coverage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+          ./test/cpp/run_coverage.sh --ci
+
+      - name: Build C++ coverage badge
+        if: always() && hashFiles('.cache/reports/coverage/cpp/coverage-summary.json') != ''
+        run: |
+          python .github/scripts/build_coverage_badges.py \
+            --kind cpp-runtime \
+            --report .cache/reports/coverage/cpp/coverage-summary.json \
+            --thresholds test/cpp/coverage-thresholds.json \
+            --output .cache/reports/coverage/coverage-cpp-runtime.json
+
+      - name: Upload C++ coverage badge
+        if: always() && hashFiles('.cache/reports/coverage/coverage-cpp-runtime.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: cpp-coverage-badge
+          path: .cache/reports/coverage/coverage-cpp-runtime.json
+          retention-days: 14
+
+  test-python:
+    name: Python Unit Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore shared NPZ cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .cache/npz
+          key: ${{ format('npz-cache-v2-{0}-{1}', runner.os, hashFiles('data/dataset_info.json', 'src/python/micro_espectre/runtime_policy.py', 'tools/lib/csi_io.py', 'tools/lib/dataset_metadata.py', 'tools/lib/npz_cache.py', 'tools/lib/performance_report.py', 'tools/train_ml_model.py', 'tools/validate_dataset_quality.py', 'test/python/performance/test_packet_rate_adaptation_regression.py')) }}
+          restore-keys: |
+            npz-cache-v2-${{ runner.os }}-
+
+      - uses: ./.github/actions/setup-doxygen
+
+      - name: Run Product and Performance Tests with Coverage
+        run: ./test/python/run_coverage.sh
+        env:
+          PYTEST_XDIST_AUTO_NUM_WORKERS: '4'
+
+      - name: Build Python coverage badge
+        if: always() && hashFiles('.cache/reports/coverage/python-coverage.json') != ''
+        run: |
+          python .github/scripts/build_coverage_badges.py \
+            --kind python \
+            --report .cache/reports/coverage/python-coverage.json \
+            --thresholds test/python/coverage-thresholds.json \
+            --output .cache/reports/coverage/coverage-python.json
+
+      - name: Upload Python coverage badge
+        if: always() && hashFiles('.cache/reports/coverage/coverage-python.json') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: python-coverage-badge
+          path: .cache/reports/coverage/coverage-python.json
+          retention-days: 14
+
+  build-esphome:
+    needs: [prepare, build-site, test-cpp, test-python]
+    permissions:
+      contents: read
+    name: Build ESPHome ${{ matrix.chip }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: ESP32
+            config: src/cpp/frontend/esphome/examples/espectre-esp32.yaml
+          - chip: ESP32-S3
+            config: src/cpp/frontend/esphome/examples/espectre-s3.yaml
+          - chip: ESP32-S2
+            config: src/cpp/frontend/esphome/examples/espectre-s2.yaml
+          - chip: ESP32-C3
+            config: src/cpp/frontend/esphome/examples/espectre-c3.yaml
+          - chip: ESP32-C5
+            config: src/cpp/frontend/esphome/examples/espectre-c5.yaml
+          - chip: ESP32-C6
+            config: src/cpp/frontend/esphome/examples/espectre-c6.yaml
+    
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+      
+      - name: Install ESPHome
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile signed ESPHome firmware
+        id: esphome-artifacts
+        env:
+          ESPECTRE_GIT_VERSION: ${{ needs.prepare.outputs.version }}
+          FIRMWARE_SIGNING_KEY_RSA: ${{ needs.prepare.outputs.sign == 'true' && secrets.FIRMWARE_SIGNING_KEY_RSA || '' }}
+          FIRMWARE_SIGNING_KEY_ESP32: ${{ needs.prepare.outputs.sign == 'true' && secrets.FIRMWARE_SIGNING_KEY_ESP32 || '' }}
+        run: |
+          TARGET=$(echo "${{ matrix.chip }}" | tr '[:upper:]' '[:lower:]' | tr -d '-')
+          python .github/scripts/build_signed_firmware.py esphome \
+            --config "${{ matrix.config }}" --target "$TARGET" \
+            --version "$ESPECTRE_GIT_VERSION" ${{ needs.prepare.outputs.sign != 'true' && '--test-key' || '' }}
+
+      - name: Rename ESPHome firmware
+        run: |
+          mkdir -p .cache/firmware
+          CHIP=$(echo "${{ matrix.chip }}" | tr '[:upper:]' '[:lower:]' | tr -d '-')
+          PREFIX="espectre-esphome-${{ needs.prepare.outputs.artifact_suffix }}"
+          cp "${{ steps.esphome-artifacts.outputs.factory_bin }}" ".cache/firmware/${PREFIX}-${CHIP}.bin"
+          cp "${{ steps.esphome-artifacts.outputs.ota_bin }}" ".cache/firmware/${PREFIX}-${CHIP}-ota.bin"
+
+      - name: Build ESPHome compliance artifacts
+        env:
+          ESPECTRE_GIT_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          PROJECT_DESCRIPTION="${{ steps.esphome-artifacts.outputs.project_description }}"
+          test -n "${PROJECT_DESCRIPTION}"
+          for FIRMWARE in .cache/firmware/espectre-esphome-*.bin; do
+            python .github/scripts/build_firmware_compliance.py \
+              --frontend esphome \
+              --project-description "${PROJECT_DESCRIPTION}" \
+              --firmware "${FIRMWARE}" \
+              --output-dir .cache/firmware
+          done
+      - name: Stage ESPHome firmware audit input
+        run: |
+          mkdir -p .cache/audit-input
+          for SBOM in .cache/firmware/espectre-esphome-*-sbom.spdx.json; do
+            case "${SBOM}" in *-ota-sbom.spdx.json) continue ;; esac
+            cp "${SBOM}" ".cache/audit-input/${{ matrix.chip }}.spdx.json"
+          done
+          test -f ".cache/audit-input/${{ matrix.chip }}.spdx.json"
+
+      - name: Upload ESPHome firmware audit input
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          name: audit-firmware-esphome-${{ matrix.chip }}
+          path: .cache/audit-input/${{ matrix.chip }}.spdx.json
+          retention-days: 1
+
+      - name: Upload ESPHome firmware artifact
+        if: success() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: firmware-esphome-${{ matrix.chip }}
+          path: .cache/firmware/espectre-esphome-*
+          retention-days: 7
+
+  build-matter:
+    needs: [prepare, build-site, test-cpp, test-python]
+    permissions:
+      contents: read
+    name: Build Matter ${{ matrix.chip }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: ESP32
+            target: esp32
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.defaults.esp32
+          - chip: ESP32-C3
+            target: esp32c3
+          - chip: ESP32-C5
+            target: esp32c5
+          - chip: ESP32-C6
+            target: esp32c6
+          - chip: ESP32-S3
+            target: esp32s3
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      # Keep dependencies and compiled objects per target. The target suffix
+      # prevents parallel matrix jobs from competing to populate one cache.
+      - name: Cache Matter toolchain, components, and compiler objects
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            .cache/build/matter-home
+            src/cpp/frontend/matter/app/managed_components
+          key: matter-${{ runner.os }}-idf-v5.5-build-v3-${{ matrix.target }}-${{ hashFiles('requirements.txt', 'src/cpp/frontend/matter/app/main/idf_component.yml', 'src/cpp/frontend/matter/app/sdkconfig.defaults*') }}
+          restore-keys: |
+            matter-${{ runner.os }}-idf-v5.5-build-v3-${{ matrix.target }}-
+            matter-${{ runner.os }}-idf-v5.5-deps-v2-
+
+      - name: Build Matter firmware
+        run: |
+          mkdir -p .cache/firmware
+          .github/scripts/build_matter_firmware.sh
+        env:
+          ESPECTRE_GIT_VERSION: ${{ needs.prepare.outputs.version }}
+          MATTER_TARGET: ${{ matrix.target }}
+          MATTER_OUTPUT: ${{ github.workspace }}/.cache/firmware/espectre-matter-${{ needs.prepare.outputs.artifact_suffix }}-${{ matrix.target }}.bin
+          MATTER_SDKCONFIG_DEFAULTS: ${{ matrix.sdkconfig_defaults || '' }}
+
+      - name: Stage Matter firmware audit input
+        run: |
+          mkdir -p .cache/audit-input
+          cp .cache/firmware/espectre-matter-*-sbom.spdx.json ".cache/audit-input/${{ matrix.chip }}.spdx.json"
+
+      - name: Upload Matter firmware audit input
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          name: audit-firmware-matter-${{ matrix.chip }}
+          path: .cache/audit-input/${{ matrix.chip }}.spdx.json
+          retention-days: 1
+
+      - name: Upload Matter firmware artifact
+        if: success() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: firmware-matter-${{ matrix.chip }}
+          path: .cache/firmware/espectre-matter-*
+          retention-days: 7
+
+  build-native:
+    needs: [prepare, build-site, test-cpp, test-python]
+    permissions:
+      contents: read
+    name: Build Native ${{ matrix.chip }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: ESP32
+            target: esp32
+            sdkconfig_defaults: sdkconfig.defaults;sdkconfig.defaults.esp32
+          - chip: ESP32-C3
+            target: esp32c3
+          - chip: ESP32-C5
+            target: esp32c5
+          - chip: ESP32-C6
+            target: esp32c6
+          - chip: ESP32-S3
+            target: esp32s3
+          - chip: ESP32-S2
+            target: esp32s2
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up firmware signing
+        uses: ./.github/actions/setup-firmware-signing
+
+      # The cached home contains target-independent Python and component dependencies.
+      - name: Cache native toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .cache/build/native-home
+          key: native-${{ runner.os }}-idf-v5.5-deps-v2-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            native-${{ runner.os }}-idf-v5.5-deps-v2-
+
+      - name: Build native firmware
+        run: |
+          mkdir -p .cache/firmware
+          python .github/scripts/build_signed_firmware.py native ${{ needs.prepare.outputs.sign != 'true' && '--test-key' || '' }}
+        env:
+          ESPECTRE_GIT_VERSION: ${{ needs.prepare.outputs.version }}
+          FIRMWARE_SIGNING_KEY_RSA: ${{ needs.prepare.outputs.sign == 'true' && secrets.FIRMWARE_SIGNING_KEY_RSA || '' }}
+          FIRMWARE_SIGNING_KEY_ESP32: ${{ needs.prepare.outputs.sign == 'true' && secrets.FIRMWARE_SIGNING_KEY_ESP32 || '' }}
+          NATIVE_TARGET: ${{ matrix.target }}
+          NATIVE_OUTPUT: ${{ github.workspace }}/.cache/firmware/espectre-native-${{ needs.prepare.outputs.artifact_suffix }}-${{ matrix.target }}.bin
+          NATIVE_OTA_OUTPUT: ${{ github.workspace }}/.cache/firmware/espectre-native-${{ needs.prepare.outputs.artifact_suffix }}-${{ matrix.target }}-ota.bin
+          NATIVE_OTA_CHANNEL: ${{ needs.prepare.outputs.ota_channel }}
+          NATIVE_SDKCONFIG_DEFAULTS: ${{ matrix.sdkconfig_defaults || '' }}
+
+      - name: Stage native firmware audit input
+        run: |
+          mkdir -p .cache/audit-input
+          for SBOM in .cache/firmware/espectre-native-*-sbom.spdx.json; do
+            case "${SBOM}" in *-ota-sbom.spdx.json) continue ;; esac
+            cp "${SBOM}" ".cache/audit-input/${{ matrix.chip }}.spdx.json"
+          done
+          test -f ".cache/audit-input/${{ matrix.chip }}.spdx.json"
+
+      - name: Upload native firmware audit input
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          name: audit-firmware-native-${{ matrix.chip }}
+          path: .cache/audit-input/${{ matrix.chip }}.spdx.json
+          retention-days: 1
+
+      - name: Upload native firmware artifact
+        if: success() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: firmware-native-${{ matrix.chip }}
+          path: .cache/firmware/espectre-native-*
+          retention-days: 7
+
+  build-sdk:
+    name: Build SDK Package
+    needs: [prepare, build-site, test-cpp, test-python]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      publication: ${{ needs.prepare.outputs.publication }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-sdk-packaging
+
+      - uses: ./.github/actions/setup-doxygen
+
+      - name: Build SDK package
+        env:
+          SDK_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          SDK_VERSION: ${{ needs.prepare.outputs.version }}
+          SDK_RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          mkdir -p .cache/sdk
+          python .github/scripts/build_sdk_package.py \
+            --channel "$SDK_CHANNEL" \
+            --version "$SDK_VERSION" \
+            --release-tag "$SDK_RELEASE_TAG" \
+            --output-dir .cache/sdk \
+            --component-output-dir .cache/registry/espectre \
+            --commit "${{ github.sha }}"
+
+      - name: Upload SDK package artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          include-hidden-files: true
+          name: sdk-bundle
+          path: |
+            .cache/sdk/espectre-sdk-*.tar.gz
+            .cache/sdk/espectre-sdk-*.zip
+            .cache/sdk/sdk-manifest-*.json
+          retention-days: 7
+
+      - name: Upload registry component
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          overwrite: true
+          name: registry-component
+          path: |
+            .cache/registry/espectre-component-*.tgz
+            .cache/registry/component-inventory.json
+          if-no-files-found: error
+          retention-days: 7
+
+  audit-esphome:
+    name: Audit ESPHome firmware dependencies
+    needs: build-esphome
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install audit dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Download firmware audit inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: audit-firmware-esphome-*
+          path: .cache/audit-input
+          merge-multiple: true
+
+      - name: Audit ESPHome firmware dependencies
+        run: |
+          python .github/scripts/audit_firmware_dependencies.py \
+            --frontend esphome \
+            --sbom .cache/audit-input/*.spdx.json \
+            --expected-target ESP32 \
+            --expected-target ESP32-S2 \
+            --expected-target ESP32-S3 \
+            --expected-target ESP32-C3 \
+            --expected-target ESP32-C5 \
+            --expected-target ESP32-C6 \
+            --output-dir .cache/reports/firmware/esphome
+
+      - name: Summarize firmware audit
+        if: always()
+        run: |
+          if [ -f .cache/reports/firmware/esphome/summary.md ]; then
+            cat .cache/reports/firmware/esphome/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Firmware dependency audit did not produce a report.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload firmware vulnerability alerts
+        if: always() && hashFiles('.cache/reports/firmware/esphome/results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          sarif_file: .cache/reports/firmware/esphome/results.sarif
+          category: firmware/esphome
+
+  audit-matter:
+    name: Audit Matter firmware dependencies
+    needs: build-matter
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install audit dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Download firmware audit inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: audit-firmware-matter-*
+          path: .cache/audit-input
+          merge-multiple: true
+
+      - name: Audit Matter firmware dependencies
+        run: |
+          python .github/scripts/audit_firmware_dependencies.py \
+            --frontend matter \
+            --sbom .cache/audit-input/*.spdx.json \
+            --expected-target ESP32 \
+            --expected-target ESP32-C3 \
+            --expected-target ESP32-C5 \
+            --expected-target ESP32-C6 \
+            --expected-target ESP32-S3 \
+            --output-dir .cache/reports/firmware/matter
+
+      - name: Summarize firmware audit
+        if: always()
+        run: |
+          if [ -f .cache/reports/firmware/matter/summary.md ]; then
+            cat .cache/reports/firmware/matter/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Firmware dependency audit did not produce a report.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload firmware vulnerability alerts
+        if: always() && hashFiles('.cache/reports/firmware/matter/results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          sarif_file: .cache/reports/firmware/matter/results.sarif
+          category: firmware/matter
+
+  audit-native:
+    name: Audit Native firmware dependencies
+    needs: build-native
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install audit dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Download firmware audit inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: audit-firmware-native-*
+          path: .cache/audit-input
+          merge-multiple: true
+
+      - name: Audit Native firmware dependencies
+        run: |
+          python .github/scripts/audit_firmware_dependencies.py \
+            --frontend native \
+            --sbom .cache/audit-input/*.spdx.json \
+            --expected-target ESP32 \
+            --expected-target ESP32-C3 \
+            --expected-target ESP32-C5 \
+            --expected-target ESP32-C6 \
+            --expected-target ESP32-S2 \
+            --expected-target ESP32-S3 \
+            --output-dir .cache/reports/firmware/native
+
+      - name: Summarize firmware audit
+        if: always()
+        run: |
+          if [ -f .cache/reports/firmware/native/summary.md ]; then
+            cat .cache/reports/firmware/native/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Firmware dependency audit did not produce a report.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload firmware vulnerability alerts
+        if: always() && hashFiles('.cache/reports/firmware/native/results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@24c7eb380a2dc368f2d129e4c65e51d172983a1e # v4
+        with:
+          sarif_file: .cache/reports/firmware/native/results.sarif
+          category: firmware/native
+
+  verify-sdk-component:
+    name: SDK
+    needs: build-sdk
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/sdk-component.yml
+    with:
+      publication: ${{ needs.build-sdk.outputs.publication }}
+
+  dispatch-publication:
+    name: Dispatch Publication
+    needs: [audit-esphome, audit-matter, audit-native, verify-sdk-component]
+    if: >
+      success() && github.event_name == 'push' && !github.event.deleted &&
+      contains(fromJSON('["snapshot", "release"]'), needs.verify-sdk-component.outputs.publication)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start continuous delivery
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          PUBLICATION: ${{ needs.verify-sdk-component.outputs.publication }}
+        with:
+          script: |
+            const publication = process.env.PUBLICATION;
+            if (!['snapshot', 'release'].includes(publication)) throw new Error('Invalid publication channel.');
+            const response = await github.rest.actions.createWorkflowDispatch({
+              ...context.repo,
+              workflow_id: 'cd.yml',
+              ref: context.ref,
+              inputs: {
+                source_run_id: String(context.runId),
+                source_run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+                source_sha: context.sha,
+              },
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            });
+            if (!Number.isSafeInteger(response.data.workflow_run_id)) {
+              throw new Error('The publication dispatch did not return a workflow run ID.');
+            }
+            core.info(`Publication: ${response.data.html_url}`);
+            await core.summary.addHeading('Publication')
+              .addLink(`CD run (${publication})`, response.data.html_url)
+              .addRaw('\nPublication has its own status; this CI run reports the build and check results.\n')
+              .write();
