@@ -1,0 +1,419 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Commercial licensing available under separate agreement; see LICENSING.md.
+"""
+ESPectre - SDK Surface Invariants
+
+Guards the invariants that keep the published C++ SDK surface coherent, which
+a compiler cannot see because they hold across separate artifacts: the
+`espectre_sdk.h` facade and the Doxygen input list. Generation also checks
+that the supported headers appear in the emitted XML.
+
+The failure these protect against is a real one: a public type added to the
+runtime layer, used in a facade-visible signature, but never made reachable
+through the facade, leaving integrators with an incomplete type.
+
+Author: Francesco Pace <francesco.pace@gmail.com>
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+from tools.lib.repo_paths import repo_root
+
+REPO_ROOT = repo_root()
+CPP_ROOT = REPO_ROOT / "src" / "cpp"
+FACADE = CPP_ROOT / "espectre_sdk.h"
+CORE_FACADE = CPP_ROOT / "espectre_core_sdk.h"
+PROTOCOL_FACADE = CPP_ROOT / "espectre_protocol_sdk.h"
+SERVICES_FACADE = CPP_ROOT / "espectre_services_sdk.h"
+MQTT_FACADE = CPP_ROOT / "espectre_mqtt_sdk.h"
+DOXYFILE = CPP_ROOT / "Doxyfile"
+SDK_GUIDE = REPO_ROOT / "docs" / "SDK.md"
+SDK_COMPONENT_CMAKE = CPP_ROOT / "CMakeLists.txt"
+RUNTIME_INTERNAL_HEADERS = {
+    "core/base_detector.h",
+    "core/csi_features.h",
+    "core/csi_format.h",
+    "core/filtered_turbulence_ring.h",
+    "core/filters.h",
+    "core/high_accuracy_detector.h",
+    "core/l1_delta_tracker.h",
+    "core/lightweight_detector.h",
+    "core/ml_feature_trackers.h",
+    "core/ml_weights.h",
+    "core/threshold.h",
+    "core/utils.h",
+}
+CORE_PUBLIC_HEADERS = {
+    "espectre_core_sdk.h",
+    "runtime/espectre_sdk_version.h",
+    "core/espectre_log.h",
+    "core/base_detector.h",
+    "core/csi_format.h",
+    "core/csi_types.h",
+    "core/detector_limits.h",
+    "core/detector_types.h",
+    "core/filter_config.h",
+    "core/high_accuracy_detector.h",
+    "core/lightweight_detector.h",
+    "core/temporal_csi_sampler.h",
+}
+CORE_IMPLEMENTATION_HEADERS = {
+    "core/csi_features.h",
+    "core/filtered_turbulence_ring.h",
+    "core/filters.h",
+    "core/l1_delta_tracker.h",
+    "core/ml_feature_trackers.h",
+    "core/threshold.h",
+    "core/utils.h",
+}
+
+# Backend types the controller holds only through a private owning pointer.
+# Integrators cannot name them, so they stay opaque and out of the surface.
+OPAQUE_IMPLEMENTATION_TYPES = {"IEspectreRuntime", "RuntimeTrafficSources"}
+
+# Unprefixed object-like macros from Arduino-ESP32 `Arduino.h` and
+# `esp32-hal-gpio.h`, which every sketch includes before the SDK.
+ARDUINO_CORE_MACROS = {
+    "ANALOG", "BIN", "CHANGE", "DEC", "DEFAULT", "DEG_TO_RAD", "DEPRECATED", "DISABLED",
+    "DISPLAY", "EULER", "EXTERNAL", "FALLING", "HALF_PI", "HEX", "HIGH", "INPUT",
+    "INPUT_PULLDOWN", "INPUT_PULLUP", "LOW", "LSBFIRST", "MSBFIRST", "NOP", "OCT", "ONHIGH",
+    "ONHIGH_WE", "ONLOW", "ONLOW_WE", "OPEN_DRAIN", "OUTPUT", "OUTPUT_OPEN_DRAIN", "PI",
+    "PULLDOWN", "PULLUP", "RAD_TO_DEG", "RISING", "SERIAL", "TWO_PI",
+}
+# Function-like macros from `Arduino.h`, `WCharacter.h`, `esp32-hal.h`, and
+# `esp32-hal-log.h`. They expand only when followed by a parenthesis.
+ARDUINO_CORE_FUNCTION_MACROS = {
+    "_BV", "_NOP", "_abs", "_max", "_min", "_round", "bit", "bitClear", "bitRead", "bitSet",
+    "bitToggle", "bitWrite", "cli", "constrain", "degrees", "highByte", "interrupts",
+    "isascii", "log_d", "log_e", "log_i", "log_n", "log_v", "log_w", "lowByte",
+    "noInterrupts", "optimistic_yield", "radians", "sei", "sq", "toascii", "word",
+}
+
+FACADE_INCLUDE_PATTERN = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
+FORWARD_DECLARATION_PATTERN = re.compile(r"^\s*(?:struct|class)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.MULTILINE)
+DEFINITION_PATTERN = re.compile(
+    r"^\s*(?:struct|class)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:final\s*)?(?::[^;{]*)?\{",
+    re.MULTILINE,
+)
+
+
+def facade_includes() -> list[str]:
+    """Header paths the facade pulls in, relative to the SDK root."""
+    return FACADE_INCLUDE_PATTERN.findall(FACADE.read_text(encoding="utf-8"))
+
+
+def include_closure(root_header: Path) -> list[Path]:
+    """The complete local include closure rooted at one published facade."""
+    available_by_name: dict[str, list[Path]] = {}
+    maintained_headers = list(CPP_ROOT.glob("*.h"))
+    for root in (CPP_ROOT / "core", CPP_ROOT / "runtime"):
+        maintained_headers.extend(root.rglob("*.h"))
+    for header in maintained_headers:
+        available_by_name.setdefault(header.name, []).append(header)
+
+    headers: list[Path] = []
+    pending = [root_header]
+    visited: set[Path] = set()
+    while pending:
+        header = pending.pop()
+        if header in visited:
+            continue
+        visited.add(header)
+        headers.append(header)
+
+        for include in FACADE_INCLUDE_PATTERN.findall(header.read_text(encoding="utf-8")):
+            candidates = [header.parent / include, CPP_ROOT / include]
+            if "/" not in include:
+                candidates.extend(available_by_name.get(include, []))
+            resolved = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+            if resolved is not None and resolved.is_relative_to(CPP_ROOT):
+                pending.append(resolved)
+
+    return sorted(headers)
+
+
+def facade_reachable_headers() -> list[Path]:
+    """The complete local include closure rooted at the runtime facade."""
+    return include_closure(FACADE)
+
+
+def facade_reachable_header_names() -> set[str]:
+    """Paths in the public include closure, relative to the SDK root."""
+    return {header.relative_to(CPP_ROOT).as_posix() for header in facade_reachable_headers()}
+
+
+def doxygen_input_headers() -> set[str]:
+    """Header paths listed in the Doxyfile INPUT block, relative to the SDK root."""
+    source = DOXYFILE.read_text(encoding="utf-8")
+    input_block = re.search(r"^INPUT\s*=(.*?)(?=^\w+\s*=)", source, re.MULTILINE | re.DOTALL)
+    assert input_block is not None, "Doxyfile has no INPUT block"
+    return {
+        match.replace("src/cpp/", "", 1)
+        for match in re.findall(r"src/cpp/[\w/]+\.h", input_block.group(1))
+    }
+
+
+def test_every_facade_include_resolves_to_a_real_header() -> None:
+    for include in facade_includes():
+        assert (CPP_ROOT / include).is_file(), (
+            f"{FACADE.name} includes a header that does not exist: {include}"
+        )
+    headers = facade_reachable_headers()
+    assert len(headers) > 1, "the facade should include the supported surface"
+
+
+@pytest.mark.parametrize("header", facade_reachable_headers(), ids=lambda path: path.name)
+def test_forward_declarations_are_defined_somewhere_reachable(header: Path) -> None:
+    """A type named in the supported surface must be constructible from the facade.
+
+    Forward declarations are a legitimate way to decouple headers, but only when
+    the definition still arrives through `espectre_sdk.h`. Otherwise an
+    integrator sees the type in a signature and cannot instantiate it.
+    """
+    defined: set[str] = set()
+    for reachable in facade_reachable_headers():
+        defined.update(DEFINITION_PATTERN.findall(reachable.read_text(encoding="utf-8")))
+
+    declared = set(FORWARD_DECLARATION_PATTERN.findall(header.read_text(encoding="utf-8")))
+    unresolved = sorted(declared - defined - OPAQUE_IMPLEMENTATION_TYPES)
+    assert not unresolved, (
+        f"{header.name} forward-declares {unresolved} but no header reachable from "
+        f"{FACADE.name} defines them, so the type is incomplete for SDK consumers"
+    )
+
+
+def test_opaque_implementation_types_stay_out_of_the_published_surface() -> None:
+    """The runtime backend is internal: no published facade may define it."""
+    reachable = set(facade_reachable_headers()) | set(include_closure(SERVICES_FACADE)) | set(include_closure(MQTT_FACADE))
+    defined: set[str] = set()
+    for header in reachable:
+        defined.update(DEFINITION_PATTERN.findall(header.read_text(encoding="utf-8")))
+    assert not (defined & OPAQUE_IMPLEMENTATION_TYPES), (
+        f"internal backend types reached the SDK surface: {sorted(defined & OPAQUE_IMPLEMENTATION_TYPES)}"
+    )
+
+
+def test_public_identifiers_avoid_arduino_core_macros() -> None:
+    """Arduino-ESP32 macros must not match a public identifier.
+
+    A sketch includes `Arduino.h` before any library, and the preprocessor
+    rewrites tokens regardless of scope, so `TrafficGeneratorMode::EXTERNAL`
+    would become `TrafficGeneratorMode::0`.
+    """
+    public: set[Path] = set()
+    for facade in (FACADE, CORE_FACADE, PROTOCOL_FACADE, SERVICES_FACADE, MQTT_FACADE):
+        public.update(include_closure(facade))
+    offenders: list[str] = []
+    for header in sorted(public):
+        source = re.sub(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"", "", header.read_text(encoding="utf-8"), flags=re.DOTALL)
+        names = set(re.findall(r"\b[A-Z][A-Z0-9_]*\b", source)) & ARDUINO_CORE_MACROS
+        names |= set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", source)) & ARDUINO_CORE_FUNCTION_MACROS
+        for name in sorted(names):
+            offenders.append(f"{header.relative_to(CPP_ROOT).as_posix()}: {name}")
+    assert not offenders, f"public identifiers collide with Arduino-ESP32 macros: {offenders}"
+
+
+def test_facade_headers_are_all_in_the_generated_reference() -> None:
+    """Everything the facade exposes has to appear in the API reference.
+
+    The relation is a subset, not equality: the Doxyfile may deliberately document
+    headers that the facade does not include directly.
+    """
+    missing = sorted(facade_reachable_header_names() - doxygen_input_headers())
+    assert not missing, (
+        f"headers reachable from {FACADE.name} are absent from the Doxyfile INPUT list: {missing}"
+    )
+
+
+def test_shared_layers_do_not_depend_on_esp_log() -> None:
+    offenders: list[str] = []
+    for layer in (CPP_ROOT / "core", CPP_ROOT / "runtime"):
+        for path in (*layer.rglob("*.h"), *layer.rglob("*.cpp")):
+            source = path.read_text(encoding="utf-8")
+            if re.search(r"#include\s*[<\"]esp_log\.h[>\"]|\bESP_LOG[A-Z_]*\b", source):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+
+    assert not offenders, f"shared SDK sources still use esp_log: {sorted(offenders)}"
+    component_cmake = SDK_COMPONENT_CMAKE.read_text(encoding="utf-8")
+    assert re.search(r"^\s+log\s*$", component_cmake, flags=re.MULTILINE) is None, (
+        "the shared SDK component must not require ESP-IDF's log component"
+    )
+
+
+def test_idf_frontend_log_sinks_forward_standard_line_formatting() -> None:
+    adapters = (
+        CPP_ROOT / "frontend" / "native" / "app" / "main" / "app_main.cpp",
+        CPP_ROOT / "frontend" / "matter" / "app" / "main" / "app_main.cpp",
+        REPO_ROOT
+        / "src"
+        / "python"
+        / "micro_espectre"
+        / "firmware"
+        / "native_components"
+        / "native_log_sink.cpp",
+    )
+    for adapter in adapters:
+        source = adapter.read_text(encoding="utf-8")
+        assert "esp_log_va" in source
+        assert "ESP_LOG_CONFIGS_DEFAULT" in source
+        assert "std::vsnprintf" not in source
+        assert "ESP_LOG_LEVEL" not in source
+        assert "esp_log_writev" not in source
+
+    idf_defaults = (
+        CPP_ROOT / "frontend" / "native" / "app" / "sdkconfig.defaults",
+        CPP_ROOT / "frontend" / "matter" / "app" / "sdkconfig.defaults",
+        REPO_ROOT
+        / "src"
+        / "python"
+        / "micro_espectre"
+        / "firmware"
+        / "boards"
+        / "sdkconfig.micro_espectre",
+    )
+    for defaults in idf_defaults:
+        source = defaults.read_text(encoding="utf-8")
+        assert "CONFIG_LOG_VERSION_2=y" in source
+
+
+def test_generated_reference_uses_consumer_include_paths() -> None:
+    source = DOXYFILE.read_text(encoding="utf-8")
+    assert re.search(r"(?m)^STRIP_FROM_INC_PATH\s*=\s*src/cpp\s*$", source)
+
+
+def test_generated_reference_uses_stable_symbol_ids() -> None:
+    source = DOXYFILE.read_text(encoding="utf-8")
+    assert re.search(r"(?m)^CASE_SENSE_NAMES\s*=\s*NO\s*$", source)
+
+
+def test_runtime_facade_does_not_reach_detector_implementation_headers() -> None:
+    """The recommended include must stay free of the advanced detector implementation."""
+    leaked = sorted(facade_reachable_header_names() & RUNTIME_INTERNAL_HEADERS)
+    assert not leaked, (
+        f"{FACADE.name} leaks core-only implementation headers: {leaked}; "
+        "keep them behind espectre_core_sdk.h"
+    )
+
+
+def test_core_facade_is_complete_documented_and_mapped() -> None:
+    """The opt-in detector facade gets the same completeness checks as the runtime facade."""
+    reachable = include_closure(CORE_FACADE)
+    assert len(reachable) > 1, "the core facade should include the detector surface"
+
+    defined: set[str] = set()
+    declared: set[str] = set()
+    for header in reachable:
+        source = header.read_text(encoding="utf-8")
+        defined.update(DEFINITION_PATTERN.findall(source))
+        declared.update(FORWARD_DECLARATION_PATTERN.findall(source))
+    assert not (declared - defined), (
+        f"{CORE_FACADE.name} leaves public types incomplete: {sorted(declared - defined)}"
+    )
+
+    names = {header.relative_to(CPP_ROOT).as_posix() for header in reachable}
+    assert CORE_PUBLIC_HEADERS <= names, (
+        f"the declared core SDK header set is not reachable from {CORE_FACADE.name}: "
+        f"{sorted(CORE_PUBLIC_HEADERS - names)}"
+    )
+    assert not (CORE_PUBLIC_HEADERS - doxygen_input_headers()), (
+        f"supported core SDK headers are absent from the Doxyfile INPUT list: "
+        f"{sorted(CORE_PUBLIC_HEADERS - doxygen_input_headers())}"
+    )
+    assert not (CORE_IMPLEMENTATION_HEADERS & doxygen_input_headers()), (
+        "core implementation dependencies leaked into the generated API reference: "
+        f"{sorted(CORE_IMPLEMENTATION_HEADERS & doxygen_input_headers())}"
+    )
+
+def test_sdk_readme_links_the_public_facades_to_the_reference() -> None:
+    """The README exposes the supported entry points and generated reference."""
+    guide = SDK_GUIDE.read_text(encoding="utf-8")
+    for facade in (FACADE, CORE_FACADE, PROTOCOL_FACADE, SERVICES_FACADE, MQTT_FACADE):
+        assert f"`{facade.name}`" in guide
+
+
+@pytest.mark.parametrize("header", sorted(set(include_closure(SERVICES_FACADE)) | set(include_closure(MQTT_FACADE))), ids=lambda path: path.name)
+def test_services_facade_is_complete(header: Path) -> None:
+    """Integrators can construct every local type named by the services facade."""
+    reachable = include_closure(SERVICES_FACADE) + include_closure(MQTT_FACADE)
+    definitions = set().union(*(set(DEFINITION_PATTERN.findall(p.read_text())) for p in reachable))
+    # Opaque platform types declared outside our namespace are not SDK types.
+    source = header.read_text()
+    _, separator, sdk_source = source.partition("namespace espectre {")
+    if not separator:
+        assert not FORWARD_DECLARATION_PATTERN.findall(source), (
+            f"{header.name}: SDK forward declarations must be in the espectre namespace"
+        )
+        return
+    declared = set(FORWARD_DECLARATION_PATTERN.findall(sdk_source)) - OPAQUE_IMPLEMENTATION_TYPES
+    assert declared <= definitions, f"{header.name}: incomplete SDK types {sorted(declared - definitions)}"
+
+
+def test_sensing_facade_leaves_the_protocol_to_its_own_facade() -> None:
+    """Sensing-only firmware does not compile the protocol, JSON, or transport contracts."""
+    protocol_headers = {
+        header
+        for header in FACADE_INCLUDE_PATTERN.findall(PROTOCOL_FACADE.read_text(encoding="utf-8"))
+        if header != FACADE.name
+    }
+    assert protocol_headers, f"{PROTOCOL_FACADE.name} should include the protocol surface"
+    leaked = sorted(protocol_headers & facade_reachable_header_names())
+    assert not leaked, f"{FACADE.name} reaches protocol headers: {leaked}"
+    for facade in (SERVICES_FACADE, MQTT_FACADE):
+        assert PROTOCOL_FACADE in include_closure(facade), f"{facade.name} must include {PROTOCOL_FACADE.name}"
+
+
+def test_services_facade_is_documented_without_exposing_detector_internals() -> None:
+    headers = {p.relative_to(CPP_ROOT).as_posix() for p in include_closure(SERVICES_FACADE) + include_closure(MQTT_FACADE)}
+    assert not headers & RUNTIME_INTERNAL_HEADERS
+    assert headers <= doxygen_input_headers()
+
+
+def test_sdk_sources_reach_other_layers_through_the_sdk_root() -> None:
+    """The SDK root is the only include directory, so layer directories never reach consumers."""
+    violations = []
+    sources = (p for root in (CPP_ROOT / "core", CPP_ROOT / "runtime") for p in root.rglob("*") if p.suffix in {".h", ".cpp"})
+    for header in sources:
+        for include in FACADE_INCLUDE_PATTERN.findall(header.read_text(encoding="utf-8")):
+            flat_in_other_layer = any(
+                (layer / include).is_file()
+                for layer in (CPP_ROOT / "core", CPP_ROOT / "runtime", CPP_ROOT / "runtime" / "esp_idf")
+                if layer != header.parent
+            )
+            if "/" not in include and not (header.parent / include).is_file() and flat_in_other_layer:
+                violations.append(f"{header.relative_to(CPP_ROOT)} -> {include}")
+    assert not violations, "Use layer-prefixed includes across SDK layers: " + ", ".join(violations)
+
+
+def test_frontends_use_only_public_sdk_headers() -> None:
+    """The first-party applications obey the same SDK boundary as external firmware."""
+    public = set(include_closure(FACADE)) | set(include_closure(SERVICES_FACADE)) | set(include_closure(MQTT_FACADE)) | set(include_closure(CORE_FACADE))
+    sdk_headers = {p.resolve() for root in (CPP_ROOT / "core", CPP_ROOT / "runtime") for p in root.rglob("*.h")}
+    by_name = {p.name: p for p in sdk_headers}
+    violations = []
+    roots = (CPP_ROOT / "frontend", REPO_ROOT / "src/python/micro_espectre/firmware/native_components")
+    for source in (path for root in roots for path in root.rglob("*")):
+        if source.suffix not in {".h", ".c", ".cpp"} or any(
+            part in {".esphome", "managed_components"} or part.startswith("build") for part in source.parts
+        ):
+            continue
+        for include in re.findall(r'^\s*#include\s*[<"]([^>"]+)[>"]', source.read_text(encoding="utf-8"), re.MULTILINE):
+            candidates = [source.parent / include, CPP_ROOT / include]
+            if "/" not in include and include in by_name:
+                candidates.append(by_name[include])
+            target = next((p.resolve() for p in candidates if p.is_file()), None)
+            if target in sdk_headers and target not in public:
+                violations.append(f"{source.relative_to(REPO_ROOT)} -> {include}")
+    assert not violations, "Frontend includes private SDK headers: " + ", ".join(violations)
+
+
+def test_esphome_schema_matches_the_public_sdk_contract() -> None:
+    """Python validation and firmware compilation must use the same sensing contract."""
+    import runpy
+
+    generator = runpy.run_path(str(REPO_ROOT / ".github" / "scripts" / "generate_esphome_schema.py"))
+    output = CPP_ROOT / "frontend" / "esphome" / "components" / "espectre" / "sensing_schema.py"
+    assert output.read_text(encoding="utf-8") == generator["render_schema"]()

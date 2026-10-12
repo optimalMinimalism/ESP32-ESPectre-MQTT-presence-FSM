@@ -1,0 +1,40 @@
+rsource "runtime/esp_idf/espectre_config/Kconfig.projbuild"
+
+menu "ESPectre SDK"
+
+comment "Optional runtime capabilities. The sensing runtime is always built."
+
+config ESPECTRE_SDK_ENABLE_FRONTEND_SUPPORT
+    bool "Build the frontend support helpers"
+    select ESPECTRE_SDK_ENABLE_PROVISIONING
+    default n
+    help
+        Shared bootstrap, control, sysinfo, and MQTT payload helpers used by
+        the reference frontends. Enable it if your integration reuses them
+        instead of wiring the runtime contracts yourself. Also enables the
+        provisioning service required by the shared Wi-Fi bootstrap helpers.
+
+config ESPECTRE_SDK_ENABLE_MQTT
+    bool "Build the ESP-IDF MQTT transport"
+    default n
+    help
+        Adds EspIdfMqttTransport, the shipped IMqttTransport implementation
+        over esp-mqtt. Leave it off if you implement IMqttTransport against
+        your own client.
+
+config ESPECTRE_SDK_ENABLE_PROVISIONING
+    bool "Build the Wi-Fi provisioning service"
+    default n
+    help
+        Adds the NVS-backed device config store and the Wi-Fi provisioning
+        service used to apply credentials supplied by the integrating firmware
+        or Direct HTTP. Improv Serial is owned by the firmware.
+
+config ESPECTRE_SDK_ENABLE_DIRECT
+    bool "Build the Direct HTTP control plane"
+    default n
+    help
+        Adds the local Direct HTTP transport, the shared runtime bridge,
+        and the canonical _espectre._tcp discovery service.
+
+endmenu

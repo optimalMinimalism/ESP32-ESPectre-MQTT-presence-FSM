@@ -1,0 +1,130 @@
+name: Stage published web channel
+description: Download one GitHub Release and stage its firmware and SDK website channel.
+
+inputs:
+  release-tag:
+    description: GitHub Release tag, or latest for the most recently published numeric release from version 3, including prereleases.
+    required: true
+  channel:
+    description: Website channel to stage.
+    required: true
+  firmware-output-dir:
+    description: Destination for staged firmware.
+    required: true
+  sdk-output-dir:
+    description: Destination for the staged SDK page and manifest.
+    required: true
+
+outputs:
+  staged:
+    description: Whether the requested release is version 3 or newer and was staged.
+    value: ${{ steps.stage.outputs.staged }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download and stage published channel
+      id: stage
+      shell: bash
+      env:
+        RELEASE_TAG_INPUT: ${{ inputs.release-tag }}
+        WEB_CHANNEL: ${{ inputs.channel }}
+        FIRMWARE_OUTPUT_DIR: ${{ inputs.firmware-output-dir }}
+        SDK_OUTPUT_DIR: ${{ inputs.sdk-output-dir }}
+      run: |
+        set -euo pipefail
+        if [[ "${RELEASE_TAG_INPUT}" == "latest" ]]; then
+          RELEASE_TAG_INPUT="$(
+            gh api --paginate --slurp "repos/${GH_REPO}/releases?per_page=100" |
+              PYTHONPATH=.github/scripts python3 -c '
+        import json, sys
+        from detect_git_version import parse_version_core
+        from validate_release import SEMVER_PATTERN
+        releases = [
+            release for page in json.load(sys.stdin) for release in page
+            if not release["draft"]
+            and SEMVER_PATTERN.fullmatch(release["tag_name"])
+            and parse_version_core(release["tag_name"])[0] >= 3
+        ]
+        latest = max(releases, key=lambda release: release["published_at"], default=None)
+        print(latest["tag_name"] if latest else "")'
+          )"
+          if [[ -z "${RELEASE_TAG_INPUT}" ]]; then
+            echo "No published release from version 3 found; skipping ${WEB_CHANNEL} channel staging."
+            echo "staged=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+        fi
+        if ! release_metadata="$(
+          gh release view "${RELEASE_TAG_INPUT}" \
+            --json tagName,targetCommitish,assets \
+            --jq '[.tagName, (.targetCommitish // ""), any(.assets[]; .name | startswith("sdk-manifest-") and endswith(".json"))] | @tsv' \
+            2>/dev/null
+        )"; then
+          echo "No ${RELEASE_TAG_INPUT} release found; skipping ${WEB_CHANNEL} channel staging."
+          echo "staged=false" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+
+        IFS=$'\t' read -r resolved_tag target_commit has_sdk_manifest <<< "${release_metadata}"
+        stage_root="$(mktemp -d)"
+        trap 'rm -rf "${stage_root}"' EXIT
+        firmware_dir="${stage_root}/firmware"
+        sdk_dir="${stage_root}/sdk"
+        mkdir -p "${firmware_dir}" "${sdk_dir}"
+
+        if [[ "${WEB_CHANNEL}" == "release" ]]; then
+          version="${resolved_tag}"
+        elif [[ "${has_sdk_manifest}" == "true" ]]; then
+          gh release download "${resolved_tag}" \
+            --pattern 'sdk-manifest-*.json' \
+            --dir "${sdk_dir}"
+          version="$(python3 .github/scripts/detect_git_version.py --from-sdk-dir "${sdk_dir}")"
+        else
+          # Older rolling releases have no SDK manifest; identify them from their tag.
+          version="$(git describe --tags --match '[0-9]*' --abbrev=7 "${resolved_tag}")"
+        fi
+        major="$(PYTHONPATH=.github/scripts python3 -c \
+          'import sys; from detect_git_version import parse_version_core; print(parse_version_core(sys.argv[1])[0])' \
+          "${version}")"
+        if (( major < 3 )); then
+          echo "Skipping ${WEB_CHANNEL} ${version}: the website serves version 3 and newer."
+          echo "staged=false" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+
+        gh release download "${resolved_tag}" \
+          --pattern '*.bin' \
+          --pattern 'firmware-manifest-*.json' \
+          --pattern 'firmware-compliance-*.zip' \
+          --pattern '*-sbom.spdx.json' \
+          --pattern '*-THIRD_PARTY_NOTICES.txt' \
+          --pattern '*-third-party-licenses.zip' \
+          --dir "${firmware_dir}" \
+          --clobber
+        catalog="${firmware_dir}/firmware-manifest-${WEB_CHANNEL}.json"
+        if [[ ! -f "${catalog}" ]] || ! python3 -c \
+          'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])).get("authentication") else 1)' "${catalog}"; then
+          echo "::warning::Omitting unsigned legacy ${WEB_CHANNEL} firmware; rebuild and publish the channel with signing enabled."
+          echo "staged=false" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+        gh release download "${resolved_tag}" \
+          --pattern 'espectre-sdk-*' \
+          --pattern 'sdk-manifest-*.json' \
+          --dir "${sdk_dir}" \
+          --clobber
+
+        python3 .github/scripts/stage_web_firmware.py --require-signature \
+          --firmware-dir "${firmware_dir}" \
+          --output-dir "${FIRMWARE_OUTPUT_DIR}" \
+          --channel "${WEB_CHANNEL}" \
+          --version "${version}" \
+          --release-tag "${resolved_tag}" \
+          --url-prefix "/artifacts/firmware/${WEB_CHANNEL}" \
+          --commit "${target_commit}"
+        python3 .github/scripts/stage_web_sdk.py \
+          --sdk-dir "${sdk_dir}" \
+          --output-dir "${SDK_OUTPUT_DIR}" \
+          --channel "${WEB_CHANNEL}"
+        echo "staged=true" >> "${GITHUB_OUTPUT}"

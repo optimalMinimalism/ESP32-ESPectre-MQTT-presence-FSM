@@ -1,0 +1,2410 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Commercial licensing available under separate agreement; see LICENSING.md.
+"""Regression tests for release, rolling, and GitHub Pages automation."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pytest
+import yaml
+
+from espectre_cli.idf_container import IDF_DOCKER_IMAGE, IDF_VERSION
+from idf_component_tools.semver import SimpleSpec, Version
+from tools.lib.repo_paths import repo_root
+
+
+REPO_ROOT = repo_root()
+SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
+PROTOCOL_HEADER = REPO_ROOT / "src" / "cpp" / "runtime" / "espectre_protocol.h"
+PYTHON_COVERAGE_THRESHOLDS = REPO_ROOT / "test" / "python" / "coverage-thresholds.json"
+PYTHON_COVERAGE_RUNNER = REPO_ROOT / "test" / "python" / "run_coverage.sh"
+BUILD_PAGES_ACTION = REPO_ROOT / ".github" / "actions" / "build-pages" / "action.yml"
+WEB_COVERAGE_RUNNER = REPO_ROOT / "test" / "web" / "run_coverage.sh"
+WEB_COVERAGE_THRESHOLDS = REPO_ROOT / "test" / "web" / "coverage-thresholds.json"
+
+
+def _markdown_links(document: str) -> list[str]:
+    """Return link targets outside fenced blocks and code spans, where C++ like `operator[](size_t)` is not a link."""
+    prose = re.sub(r"(?ms)^(`{3,})[^\n]*\n.*?^\1\s*$", "", document)
+    prose = re.sub(r"(`+).+?\1", "", prose, flags=re.S)
+    return re.findall(r"\]\(([^)]+)\)", prose)
+
+
+def _workflow_job(source: str, job_name: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(job_name)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        source,
+    )
+    assert match is not None, f"missing workflow job {job_name}"
+    return match.group("body")
+
+
+def _workflow_chip_matrix(source: str, job_name: str) -> set[str]:
+    return set(
+        re.findall(
+            r"(?m)^\s+- chip: (ESP32(?:-[A-Z0-9]+)?)$",
+            _workflow_job(source, job_name),
+        )
+    )
+
+
+def test_ci_chip_matrices_follow_production_registries() -> None:
+    from support.chip_matrix import ESPHOME_CHIPS, MATTER_CHIPS, NATIVE_CHIPS
+
+    def workflow_label(chip: str) -> str:
+        return "ESP32" if chip == "ESP32" else f"ESP32-{chip}"
+
+    source = (WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8")
+    assert _workflow_chip_matrix(source, "build-esphome") == {
+        workflow_label(chip) for chip in ESPHOME_CHIPS
+    }
+    assert _workflow_chip_matrix(source, "build-native") == {
+        workflow_label(chip) for chip in NATIVE_CHIPS
+    }
+    assert _workflow_chip_matrix(source, "build-matter") == {
+        workflow_label(chip) for chip in MATTER_CHIPS
+    }
+    cpp_job = _workflow_job(source, "test-cpp")
+    assert "./test/cpp/run_coverage.sh --ci" in cpp_job
+    assert "--kind cpp-runtime" in cpp_job
+    assert "--report .cache/reports/coverage/cpp/coverage-summary.json" in cpp_job
+    assert "--output .cache/reports/coverage/coverage-cpp-runtime.json" in cpp_job
+    assert "name: cpp-coverage-badge" in cpp_job
+    assert (
+        "if: always() && hashFiles('.cache/reports/coverage/cpp/coverage-summary.json') != ''"
+        in cpp_job
+    )
+    assert "if: always() && hashFiles('.cache/reports/coverage/coverage-cpp-runtime.json') != ''" in cpp_job
+
+    python_job = _workflow_job(source, "test-python")
+    python_runner = PYTHON_COVERAGE_RUNNER.read_text(encoding="utf-8")
+    assert "./test/python/run_coverage.sh" in python_job
+    assert "--cov=src/python/micro_espectre" in python_runner
+    assert "--cov=src/python/espectre_cli" in python_runner
+    assert "--cov-branch" in python_runner
+    assert '--cov-report="json:$REPORT"' in python_runner
+    assert '.cache/reports/coverage/python-coverage.json' in python_runner
+    assert 'test/python/check_coverage.py "$REPORT"' in python_runner
+    assert "--kind python" in python_job
+    assert "--report .cache/reports/coverage/python-coverage.json" in python_job
+    assert "--output .cache/reports/coverage/coverage-python.json" in python_job
+    assert "name: python-coverage-badge" in python_job
+    assert "if: always() && hashFiles('.cache/reports/coverage/python-coverage.json') != ''" in python_job
+    assert "if: always() && hashFiles('.cache/reports/coverage/coverage-python.json') != ''" in python_job
+
+
+def test_firmware_audits_aggregate_target_sboms_by_frontend() -> None:
+    ci_workflow = (WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8")
+    jobs = yaml.safe_load(ci_workflow)["jobs"]
+    for frontend, job_name in (("esphome", "build-esphome"), ("matter", "build-matter"), ("native", "build-native")):
+        audit_job = _workflow_job(ci_workflow, f"audit-{frontend}")
+        build_job = _workflow_job(ci_workflow, job_name)
+        expected_targets = _workflow_chip_matrix(ci_workflow, job_name)
+
+        assert f"needs: {job_name}" in audit_job
+        assert jobs[f"audit-{frontend}"].get("if", "success()") == "success()"
+        assert f"pattern: audit-firmware-{frontend}-*" in audit_job
+        assert f"category: firmware/{frontend}" in audit_job
+        assert "security-events: write" in audit_job
+        assert "continue-on-error: true" not in audit_job
+        assert "audit_firmware_dependencies.py" not in build_job
+        assert "name: audit-firmware-" + frontend + "-${{ matrix.chip }}" in build_job
+
+        for target in expected_targets:
+            assert f"--expected-target {target}" in audit_job
+
+    assert {"audit-esphome", "audit-matter", "audit-native"} <= set(jobs["dispatch-publication"]["needs"])
+    assert jobs["verify-sdk-component"]["needs"] == "build-sdk"
+    assert "verify-sdk-component" in jobs["dispatch-publication"]["needs"]
+
+
+def test_python_coverage_gate_has_fixed_thresholds() -> None:
+    thresholds = json.loads(PYTHON_COVERAGE_THRESHOLDS.read_text(encoding="utf-8"))
+
+    assert thresholds == {
+        "minimums": {"branches": 60.0, "lines": 70.0},
+        "version": 1,
+    }
+
+
+@pytest.mark.parametrize("failing_metric", [None, "lines", "branches"])
+def test_python_coverage_gate_enforces_each_metric(
+    tmp_path: Path,
+    failing_metric: str | None,
+) -> None:
+    minimums = json.loads(PYTHON_COVERAGE_THRESHOLDS.read_text(encoding="utf-8"))["minimums"]
+    measured = dict(minimums)
+    failure = None
+    if failing_metric:
+        measured[failing_metric] -= 1
+        failure = f"{failing_metric}: {measured[failing_metric]:.2f}% < {minimums[failing_metric]:.2f}%"
+    report = tmp_path / "coverage.json"
+    report.write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "covered_branches": measured["branches"],
+                    "covered_lines": measured["lines"],
+                    "num_branches": 100,
+                    "num_statements": 100,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "test/python/check_coverage.py", str(report)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == (1 if failure else 0)
+    if failure:
+        assert failure in result.stdout
+    else:
+        assert "Python coverage thresholds satisfied." in result.stdout
+
+
+def test_web_coverage_gate_uses_canonical_thresholds() -> None:
+    workflow = (WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8")
+    build_site = _workflow_job(workflow, "build-site")
+    action = BUILD_PAGES_ACTION.read_text(encoding="utf-8")
+    runner = WEB_COVERAGE_RUNNER.read_text(encoding="utf-8")
+    thresholds = json.loads(WEB_COVERAGE_THRESHOLDS.read_text(encoding="utf-8"))
+
+    assert "./test/web/run_coverage.sh" in action
+    assert "test/web/coverage-thresholds.json" in runner
+    variables = {
+        "branches": "branch_threshold",
+        "functions": "function_threshold",
+        "lines": "line_threshold",
+    }
+    for metric, variable in variables.items():
+        assert metric in thresholds["minimums"]
+        assert f'--test-coverage-{metric}=${{{variable}}}' in runner
+    assert "docs/web/assets/js/espectre-direct.js" in runner
+    assert "--kind web" in build_site
+    assert "--report .cache/reports/coverage/web-coverage.log" in build_site
+    assert "--output .cache/reports/coverage/coverage-web.json" in build_site
+    assert "name: web-coverage-badge" in build_site
+    assert "if: always() && hashFiles('.cache/reports/coverage/web-coverage.log') != ''" in build_site
+    assert "if: always() && hashFiles('.cache/reports/coverage/coverage-web.json') != ''" in build_site
+
+
+def test_cd_publishes_stable_coverage_badge_endpoints() -> None:
+    workflow = (WORKFLOWS_DIR / "cd.yml").read_text(encoding="utf-8")
+    validator = (SCRIPTS_DIR / "validate_publication_source.cjs").read_text(encoding="utf-8")
+    release_job = _workflow_job(workflow, "release")
+    publisher = _workflow_job(workflow, "publish-coverage")
+
+    caller = _workflow_job((WORKFLOWS_DIR / "ci.yml").read_text(encoding="utf-8"), "dispatch-publication")
+    assert "success() && github.event_name == 'push'" in caller
+    assert "PUBLICATION: ${{ needs.verify-sdk-component.outputs.publication }}" in caller
+    assert "source.conclusion !== 'success'" in validator
+    assert "core.setOutput('conclusion', source.conclusion)" in validator
+    assert "coverage-badges/*.json" not in release_job
+    assert "needs.validate-run.outputs.current == 'true'" in release_job
+    coverage_job = yaml.safe_load(workflow)["jobs"]["publish-coverage"]
+    assert coverage_job["needs"] == "release"
+    assert coverage_job.get("if", "success()") == "success()"
+    assert "pattern: '*-coverage-badge'" in publisher
+    assert "gh release upload" in publisher
+    assert "--clobber" in publisher
+    assert "Recheck source commit before publishing coverage" in publisher
+
+
+def test_coverage_badge_builder_reads_each_report_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = load_script("build_coverage_badges")
+    python_report = tmp_path / "python.json"
+    cpp_report = tmp_path / "cpp.json"
+    web_report = tmp_path / "web.log"
+    cpp_thresholds = REPO_ROOT / "test" / "cpp" / "coverage-thresholds.json"
+    python_minimums = json.loads(PYTHON_COVERAGE_THRESHOLDS.read_text(encoding="utf-8"))["minimums"]
+    cpp_minimums = json.loads(cpp_thresholds.read_text(encoding="utf-8"))["segments"]["runtime"]
+    web_minimums = json.loads(WEB_COVERAGE_THRESHOLDS.read_text(encoding="utf-8"))["minimums"]
+    python_metrics = {metric: value + 1 for metric, value in python_minimums.items()}
+    cpp_metrics = {metric: value + 1 for metric, value in cpp_minimums.items()}
+    web_metrics = {metric: value + 1.25 for metric, value in web_minimums.items()}
+    python_report.write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "covered_branches": python_metrics["branches"],
+                    "covered_lines": python_metrics["lines"],
+                    "num_branches": 100,
+                    "num_statements": 100,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cpp_report.write_text(
+        json.dumps(
+            {
+                "segments": {
+                    "runtime": cpp_metrics
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    web_report.write_text(
+        f"# all files | {web_metrics['lines']:.2f} | {web_metrics['branches']:.2f} | {web_metrics['functions']:.2f} |\n",
+        encoding="utf-8",
+    )
+
+    expected_python_badge = {
+        "subject": "python coverage",
+        "status": f"{python_metrics['lines']:.2f}%",
+        "color": "4c1",
+    }
+    assert builder.build_badge(
+        "python", python_report, PYTHON_COVERAGE_THRESHOLDS
+    ) == expected_python_badge
+    expected_cpp_badge = {
+        "subject": "c++ coverage",
+        "status": f"{cpp_metrics['lines']:.2f}%",
+        "color": "4c1",
+    }
+    assert builder.build_badge(
+        "cpp-runtime",
+        cpp_report,
+        cpp_thresholds,
+    ) == expected_cpp_badge
+    expected_web_badge = {
+        "subject": "web coverage",
+        "status": f"{web_metrics['lines']:.2f}%",
+        "color": "4c1",
+    }
+    assert builder.build_badge(
+        "web", web_report, WEB_COVERAGE_THRESHOLDS
+    ) == expected_web_badge
+
+    summary_path = tmp_path / "github-step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    cli_environment = os.environ.copy()
+    cli_environment.pop("GITHUB_STEP_SUMMARY", None)
+
+    output = tmp_path / "coverage-python.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "build_coverage_badges.py"),
+            "--kind",
+            "python",
+            "--report",
+            str(python_report),
+            "--thresholds",
+            str(PYTHON_COVERAGE_THRESHOLDS),
+            "--output",
+            str(output),
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        env=cli_environment,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text(encoding="utf-8")) == expected_python_badge
+    assert not summary_path.exists()
+
+    failing_report = json.loads(python_report.read_text(encoding="utf-8"))
+    failing_report["totals"]["covered_lines"] = python_minimums["lines"] - 1
+    python_report.write_text(json.dumps(failing_report), encoding="utf-8")
+    assert builder.build_badge(
+        "python", python_report, PYTHON_COVERAGE_THRESHOLDS
+    )["color"] == "e05d44"
+
+
+def _ota_release_tags() -> tuple[str, str]:
+    header = (REPO_ROOT / "src/cpp/frontend/ota_protocol.h").read_text(encoding="utf-8")
+    preview = re.search(r'ESPECTRE_OTA_RELEASE_TAG_PREVIEW\s*=\s*"([^"]+)"', header)
+    develop = re.search(r'ESPECTRE_OTA_RELEASE_TAG_DEVELOP\s*=\s*"([^"]+)"', header)
+    assert preview is not None and develop is not None
+    return preview.group(1), develop.group(1)
+
+
+def load_script(name: str):
+    path = SCRIPTS_DIR / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"test_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_sdk_staging_cleanup_keeps_recent_snapshots_and_release_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, apply: bool,
+) -> None:
+    from idf_component_tools.registry.api_models import ComponentResponse
+
+    cleaner = load_script("cleanup_sdk_registry")
+    now = datetime.now(timezone.utc)
+    legacy = f"3.0.0-rc2-4-g0150604-snapshot.develop.g{'a' * 40}"
+    legacy_main = f"3.0.0-rc2-4-g0150604-snapshot.preview.g{'b' * 40}"
+    uploads = [
+        ("3.0.0", 100), ("3.0.0-rc2", 100), ("3.0.0-custom", 100),
+        ("3.0.0-rc2-99-g123abcd.main", 30),  # Semver order is not upload order.
+        ("3.0.0-rc2-1-g123abcd.main", 9),
+        ("3.0.0-rc2-2-g123abcd.main", 8), (legacy_main, 20),
+        (legacy, 30), ("3.0.0-rc2-1-g123abcd.develop", 3),
+        ("3.0.0-rc2-2-g123abcd.develop", 2), ("3.0.0-rc2.develop", 1),
+    ]
+    component = ComponentResponse(
+        namespace="francescopace", name="espectre", versions=[
+            {"version": version, "created_at": (now - timedelta(days=age)).isoformat(),
+             "component_hash": "a" * 64, "url": "https://example.invalid/component"}
+            for version, age in uploads
+        ],
+    )
+    deletions = []
+
+    class Registry:
+        def __init__(self, registry_url, api_token=None):
+            assert registry_url == "https://components-staging.espressif.com"
+            assert api_token in (None, "test-token")
+
+        def get_component_response(self, component_name):
+            assert component_name == "francescopace/espectre"
+            return component
+
+        def delete_version(self, component_name, component_version):
+            assert component_name == "francescopace/espectre"
+            deletions.append(component_version)
+
+    monkeypatch.setattr(cleaner, "APIClient", Registry)
+    monkeypatch.setenv("IDF_COMPONENT_REGISTRY_URL", "https://components.espressif.com")
+    monkeypatch.setenv("IDF_COMPONENT_API_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    report_path = tmp_path / "cleanup.json"
+    cleaner.main(["--keep-per-branch", "2", "--report", str(report_path)] + (["--apply"] if apply else []))
+    report = json.loads(report_path.read_text())
+    expected = {legacy, legacy_main, "3.0.0-rc2-99-g123abcd.main", "3.0.0-rc2-1-g123abcd.develop"}
+    assert {entry["version"] for entry in report["versions"] if entry["action"] == "delete"} == expected
+    for branch in ("main", "develop"):
+        assert sum(entry["branch"] == branch and entry["action"] == "keep" for entry in report["versions"]) == 2
+    assert set(deletions) == (expected if apply else set())
+    assert report["deleted"] == deletions
+    assert "test-token" not in report_path.read_text()
+
+
+@pytest.mark.parametrize("failure", ["missing_time", "naive_time", "wrong_component", "no_token", "delete_error"])
+def test_sdk_staging_cleanup_fails_without_unsafe_deletions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from idf_component_tools.registry.api_models import ComponentResponse
+
+    cleaner = load_script("cleanup_sdk_registry")
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    component = ComponentResponse(
+        namespace="francescopace", name="other" if failure == "wrong_component" else "espectre",
+        versions=[{"version": f"3.0.0-{index}-g123abcd.main", "created_at": (old + timedelta(days=index)).isoformat(),
+                   "component_hash": "a" * 64, "url": "https://example.invalid/component"}
+                  for index in range(3)],
+    )
+    if failure == "missing_time":
+        component.versions[0].created_at = None
+    elif failure == "naive_time":
+        component.versions[0].created_at = old.replace(tzinfo=None).isoformat()
+    deletions = []
+
+    class Registry:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_component_response(self, **kwargs):
+            return component
+
+        def delete_version(self, component_name, component_version):
+            if deletions:
+                raise RuntimeError("Registry refused deletion")
+            deletions.append(component_version)
+
+    monkeypatch.setattr(cleaner, "APIClient", Registry)
+    monkeypatch.setenv("IDF_COMPONENT_API_TOKEN", "test-token")
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    if failure == "no_token":
+        monkeypatch.delenv("IDF_COMPONENT_API_TOKEN")
+    report_path = tmp_path / "cleanup.json"
+    with pytest.raises((ValueError, RuntimeError)):
+        cleaner.main(["--apply", "--keep-per-branch", "1", "--report", str(report_path)])
+    if failure == "delete_error":
+        assert deletions == ["3.0.0-1-g123abcd.main"]
+        assert json.loads(report_path.read_text())["deleted"] == deletions
+    else:
+        assert not deletions
+
+
+def assert_sdk_registry_installation(files: dict[str, bytes], version: str,
+                                     registry_url: str, tmp_path: Path) -> None:
+    example = yaml.safe_load(files["examples/wifi_motion_detection/main/idf_component.yml"])
+    assert example["dependencies"] == {
+        "francescopace/espectre": {"version": version, "registry_url": registry_url}
+    }
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    recorder = bin_dir / "idf.py"
+    recorder.write_text("""#!/bin/sh
+printf '%s\\t' "$@"; printf '\\n'
+if [ "$1" = create-project-from-example ]; then mkdir wifi_motion_detection; fi
+""")
+    recorder.chmod(0o755)
+    for name in ("README.md", "examples/wifi_motion_detection/README.md"):
+        blocks = re.findall(r"```sh\n(.*?)\n```", files[name].decode(), re.DOTALL)
+        commands = "\n".join(block for block in blocks if any(token in block for token in (
+            "ESPECTRE_VERSION=", "idf.py add-dependency ", "idf.py create-project-from-example ",
+        )))
+        # Execute the documented shell expansion, replacing every IDF action with a recorder.
+        project = tmp_path / name.removesuffix(".md")
+        project.mkdir(parents=True)
+        result = subprocess.run(["/bin/sh", "-e", "-c", commands],
+                                cwd=project, capture_output=True, text=True,
+                                env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
+        assert result.returncode == 0, result.stderr
+        calls = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
+        dependency = f"francescopace/espectre={version}"
+        assert ["create-project-from-example", "--registry-url", registry_url,
+                f"{dependency}:wifi_motion_detection"] in calls
+        if name == "README.md":
+            assert ["add-dependency", "--registry-url", registry_url, dependency] in calls
+
+
+@pytest.mark.parametrize("version", ["3.0.0", "3.0.0-rc3"])
+def test_sdk_archives_and_manifest_are_reproducible(tmp_path: Path, version: str) -> None:
+    builder = load_script("build_sdk_package")
+    outputs = [tmp_path / "first", tmp_path / "second"]
+    for output in outputs:
+        args = argparse.Namespace(
+            channel="release",
+            version=version,
+            release_tag=version,
+            output_dir=str(output),
+            component_output_dir=str(tmp_path / f"component-{output.name}" / "espectre"),
+            commit="0123456789abcdef0123456789abcdef01234567",
+            source_date_epoch=1_800_000_000,
+            url_prefix=None,
+        )
+        builder.build_sdk_package(args)
+
+    first_files = sorted(path.name for path in outputs[0].iterdir())
+    second_files = sorted(path.name for path in outputs[1].iterdir())
+    assert first_files == second_files
+    for filename in first_files:
+        assert (outputs[0] / filename).read_bytes() == (outputs[1] / filename).read_bytes()
+
+    verifier = load_script("verify_sdk_component")
+    packages = [tmp_path / f"component-{output.name}" for output in outputs]
+    inventories = [verifier.load_package(path / "component-inventory.json") for path in packages]
+    assert inventories[0] == inventories[1]
+    inventory, component_files = inventories[0]
+    assert (packages[0] / inventory["archive"]).read_bytes() == (packages[1] / inventory["archive"]).read_bytes()
+    component_manifest = yaml.safe_load(component_files["idf_component.yml"])
+    api = component_files["API.md"].decode()
+    readme = component_files["README.md"].decode()
+    # Shared site navigation may remain above the standalone integration guide.
+    readme_sections = readme.split("\n## ", 1)[1]
+    assert all(urlparse(link).hostname != "espectre.dev" for link in _markdown_links(readme_sections))
+    anchors = re.findall(r'<a id="([^"]+)"></a>', api)
+    assert len(anchors) == len(set(anchors))
+    for document in (readme, api):
+        for link in _markdown_links(document):
+            if link.startswith("API.md#") or (document is api and link.startswith("#")):
+                assert link.split("#", 1)[1] in anchors
+    protocol_reference = f"https://github.com/francescopace/espectre/blob/{inventory['commit']}/docs/API.md"
+    assert f"]({protocol_reference}#sensing-update-and-calibration)" in readme
+    assert f'#define ESPECTRE_SDK_VERSION_STRING "{inventory["version"]}"' in api
+    assert inventory["commit"] in api
+    assert "namespaceespectre" in anchors
+    assert "classespectre_1_1_runtime_frontend_controller" in anchors
+    assert "sdk_integration_1integration_logging" in anchors
+    assert "template <typename T, size_t Capacity>" in api
+    assert "sdk_integration.dox" not in component_files
+    source_manifest = yaml.safe_load((REPO_ROOT / "src/cpp/idf_component.yml").read_text())
+    assert component_manifest["dependencies"] == source_manifest["dependencies"]
+    assert component_manifest["dependencies"]["espressif/mdns"]["registry_url"] == "https://components.espressif.com"
+    assert component_manifest["targets"] == source_manifest["targets"]
+    assert component_manifest["license"] == "GPL-3.0-only"
+    assert component_manifest["version"] == version
+    assert {"LICENSE", "LICENSING.md", "THIRD_PARTY_NOTICES.md", "README.md", "API.md"} <= component_files.keys()
+    assert not any(part in {"frontend", "build", "managed_components", ".git"}
+                   for name in component_files for part in Path(name).parts)
+    assert f'"{version}"'.encode() in component_files["runtime/espectre_sdk_version.h"]
+    assert_sdk_registry_installation(component_files, version, "https://components.espressif.com",
+                                     tmp_path / "consumer")
+    for name in ("README.md", "API.md", "LICENSING.md", "THIRD_PARTY_NOTICES.md"):
+        for link in _markdown_links(component_files[name].decode()):
+            link = link.strip("<>")
+            if not link.startswith(("https://", "mailto:", "#")):
+                assert link.split("#", 1)[0] in component_files
+
+    manifest_path = next(outputs[0].glob("sdk-manifest-*.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["generated_at"] == "2027-01-15T08:00:00+00:00"
+    assert manifest["install_surfaces"]["cmake"]["optional_source_groups"] == [
+        "ESPECTRE_RUNTIME_FRONTEND_SUPPORT_SOURCES",
+        "ESPECTRE_RUNTIME_ESP_IDF_MQTT_SOURCES",
+        "ESPECTRE_RUNTIME_ESP_IDF_PROVISIONING_SOURCES",
+        "ESPECTRE_RUNTIME_ESP_IDF_DIRECT_SOURCES",
+    ]
+    zip_path = next(outputs[0].glob("*.zip"))
+    with zipfile.ZipFile(zip_path) as archive:
+        archived = set(archive.namelist())
+        component_cmake_name = next(
+            name for name in archived if name.endswith("/src/cpp/CMakeLists.txt")
+        )
+        doxy_name = next(name for name in archived if name.endswith("/src/cpp/Doxyfile"))
+        bundled_doxyfile = archive.read(doxy_name).decode("utf-8")
+        guide_name = next(name for name in archived if name.endswith("/docs/SDK.md"))
+        bundled_guide = archive.read(guide_name).decode("utf-8")
+        facade_name = next(name for name in archived if name.endswith("/src/cpp/espectre_sdk.h"))
+        bundled_facade = archive.read(facade_name).decode("utf-8")
+    bundle_root = component_cmake_name.removesuffix("/src/cpp/CMakeLists.txt")
+    assert f"{bundle_root}/CMakeLists.txt" not in archived
+    assert f"{bundle_root}/src/cpp/sdk_integration.dox" in archived
+    guide_sections = bundled_guide.split("\n## ", 1)[1]
+    assert all(urlparse(link).hostname != "espectre.dev" for link in _markdown_links(guide_sections))
+    assert manifest["install_surfaces"]["esp_idf_component"]["component_root"] == "src/cpp"
+    assert re.search(r"(?m)^OUTPUT_DIRECTORY\s*=\s*output\s*$", bundled_doxyfile)
+    assert re.search(rf"(?m)^PROJECT_NUMBER\s*=\s*{re.escape(version)}\s*$", bundled_doxyfile)
+    assert re.search(r"(?m)^GENERATE_HTML\s*=\s*NO\s*$", bundled_doxyfile)
+    assert re.search(r"(?m)^GENERATE_XML\s*=\s*YES\s*$", bundled_doxyfile)
+    assert not any("/src/cpp/doxygen/" in path for path in archived)
+    assert "docs/web/artifacts/sdk" not in bundled_doxyfile
+    assert "https://github.com/francescopace/espectre/blob/0123456789abcdef0123456789abcdef01234567/docs/CSI.md" in bundled_guide
+    assert "https://github.com/francescopace/espectre/blob/0123456789abcdef0123456789abcdef01234567/LICENSING.md" in bundled_guide
+    assert "https://github.com/francescopace/espectre/blob/0123456789abcdef0123456789abcdef01234567/docs/SDK.md" in bundled_facade
+    assert "https://github.com/francescopace/espectre/blob/main/docs/SDK.md" not in bundled_facade
+    assert re.search(r"\]\((?!https?://|mailto:|#)[^)]+\.md(?:#[^)]+)?\)", bundled_guide) is None
+    repo_doxyfile = (REPO_ROOT / "src" / "cpp" / "Doxyfile").read_text(encoding="utf-8")
+    assert re.search(r"(?m)^OUTPUT_DIRECTORY\s*=\s*docs/web/artifacts/sdk\s*$", repo_doxyfile)
+    assert re.search(r"(?m)^PROJECT_NUMBER\s*=\s*UNSTAMPED\s*$", repo_doxyfile)
+    assert any(path.endswith("/THIRD_PARTY_NOTICES.md") for path in archived)
+    for artifact in manifest["artifacts"]:
+        assert artifact["sha256"] == file_sha256(outputs[0] / artifact["filename"])
+
+
+@pytest.mark.parametrize(("manifest_name", "field", "value"), [
+    ("idf_component.yml", (), None),
+    ("idf_component.yml", ("version",), "3.0.1"),
+    ("idf_component.yml", ("license",), "MIT"),
+    ("idf_component.yml", ("repository_info", "commit_sha"), "b" * 40),
+    ("idf_component.yml", ("dependencies", "idf", "version"), ">=5.0"),
+    ("idf_component.yml", ("targets",), ["esp32c3"]),
+    ("idf_component.yml", ("targets",), ["esp32s2", "esp32c3"]),
+    ("idf_component.yml", ("files", "use_gitignore"), 1),
+    ("idf_component.yml", ("description",), "Unexpected field"),
+    ("examples/wifi_motion_detection/main/idf_component.yml",
+     ("dependencies", "francescopace/espectre", "version"), "3.0.1"),
+    ("examples/wifi_motion_detection/main/idf_component.yml",
+     ("dependencies", "francescopace/espectre", "registry_url"), "https://other.example"),
+    ("examples/wifi_motion_detection/main/idf_component.yml",
+     ("dependencies", "francescopace/espectre", "override_path"), "../../espectre"),
+])
+def test_registry_and_install_checks_preserve_manifest_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    manifest_name: str, field: tuple[str, ...], value: object,
+) -> None:
+    from idf_component_tools.registry import multi_storage_client
+
+    verifier = load_script("verify_sdk_component")
+    manifest = {
+        "version": "3.0.0",
+        "license": "GPL-3.0-only",
+        "repository_info": {"commit_sha": "a" * 40},
+        "dependencies": {"idf": {"version": ">=5.5.3"}},
+        "targets": ["esp32c3", "esp32s2"],
+        "files": {"use_gitignore": True},
+    }
+    example_name = "examples/wifi_motion_detection/main/idf_component.yml"
+    example = {"dependencies": {verifier.COMPONENT_NAME: {
+        "version": "3.0.0", "registry_url": "https://registry.example",
+    }}}
+    manifests = {"idf_component.yml": manifest, example_name: example}
+    expected = {
+        "idf_component.yml": yaml.safe_dump(manifest, sort_keys=False).encode(),
+        "sdk.cpp": b"void setup() {}\n",
+        example_name: yaml.safe_dump(example, sort_keys=False).encode(),
+    }
+    if field:
+        parent = manifests[manifest_name]
+        for key in field[:-1]:
+            parent = parent[key]
+        parent[field[-1]] = value
+    actual = {**expected, **{name: yaml.safe_dump(data, sort_keys=True).encode()
+                            for name, data in manifests.items()}}
+    archive = tmp_path / "registry.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        for name, data in actual.items():
+            zipped.writestr(name, data)
+    metadata = {"download_url": "https://registry.example/component.zip"}
+
+    class RegistryClient:
+        registry_storage_client = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        def component(self, name, version):
+            assert name == verifier.COMPONENT_NAME and version == "==3.0.0"
+            return metadata
+
+    monkeypatch.setattr(multi_storage_client, "MultiStorageClient", RegistryClient)
+    monkeypatch.setattr(verifier, "download", lambda url: archive.read_bytes())
+    inventory = {"version": "3.0.0", "files": verifier.hashes(expected)}
+    project = tmp_path / "wifi_motion_detection"
+    verifier.write_files(project / "managed_components/francescopace__espectre", actual)
+    (project / "dependencies.lock").write_text(yaml.safe_dump({
+        "target": "esp32c3",
+        "dependencies": {verifier.COMPONENT_NAME: {"version": "3.0.0", "source": {"type": "service"}}},
+    }))
+    checks = (
+        lambda: verifier.registry_files("https://registry.example", inventory, expected, 0),
+        lambda: verifier.verify_install(project, inventory, expected, "esp32c3"),
+    )
+    for check in checks:
+        if field:
+            with pytest.raises(ValueError, match=f"Component contents differ: {re.escape(manifest_name)}$"):
+                check()
+        else:
+            check()
+    if not field:
+        # Local artifact hashes remain byte-exact, even for equivalent YAML.
+        with pytest.raises(ValueError, match="Component contents differ"):
+            verifier.require_same_files(verifier.hashes(actual), inventory["files"])
+        for name in expected:
+            changed = {**actual, name: actual[name] + b"# changed\n"} if name == "sdk.cpp" else {
+                key: data for key, data in actual.items() if key != name
+            }
+            with pytest.raises(ValueError, match="Component contents differ"):
+                verifier.require_same_files(verifier.hashes(changed, normalize_manifest=True),
+                                            verifier.hashes(expected, normalize_manifest=True))
+        with pytest.raises(ValueError, match="Component contents differ: extra.cpp"):
+            verifier.require_same_files(verifier.hashes({**actual, "extra.cpp": b""}, normalize_manifest=True),
+                                        verifier.hashes(expected, normalize_manifest=True))
+
+
+def test_web_sdk_rejects_a_channel_mismatch_before_cleaning(tmp_path: Path) -> None:
+    stage = load_script("stage_web_sdk")
+    sdk_dir = tmp_path / "sdk"
+    output_dir = tmp_path / "output"
+    sdk_dir.mkdir()
+    output_dir.mkdir()
+    (sdk_dir / "sdk-manifest-release.json").write_text(
+        json.dumps({"schema_version": 2, "channel": "release"}), encoding="utf-8"
+    )
+    sentinel = output_dir / "index.html"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="channel mismatch"):
+        stage.stage_web_sdk(
+            argparse.Namespace(
+                sdk_dir=str(sdk_dir),
+                output_dir=str(output_dir),
+                channel="preview",
+            )
+        )
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_web_sdk_normalizes_matching_legacy_version_aliases() -> None:
+    stage = load_script("stage_web_sdk")
+    manifest = {
+        "schema_version": 1,
+        "version": "3.0.0-rc1",
+        "package_version": "3.0.0-rc1",
+        "sdk_version": "3.0.0-rc1",
+    }
+
+    normalized = stage.normalize_sdk_manifest(manifest)
+
+    assert normalized["schema_version"] == 2
+    assert normalized["version"] == "3.0.0-rc1"
+    assert "package_version" not in normalized
+    assert "sdk_version" not in normalized
+    assert manifest["schema_version"] == 1
+
+
+def test_web_sdk_rejects_conflicting_legacy_version_aliases() -> None:
+    stage = load_script("stage_web_sdk")
+    manifest = {
+        "schema_version": 1,
+        "version": "3.0.0-rc1",
+        "package_version": "2.8.0",
+        "sdk_version": "3.0.0-rc1",
+    }
+
+    with pytest.raises(ValueError, match="Legacy SDK version aliases disagree"):
+        stage.normalize_sdk_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_stability", "production_ready"),
+    [
+        ("3.0.0", "final", True),
+        ("3.0.0-rc1", "prerelease", False),
+    ],
+)
+def test_release_sdk_page_exposes_version_stability(
+    version: str, expected_stability: str, production_ready: bool
+) -> None:
+    stage = load_script("stage_web_sdk")
+    manifest = {
+        "channel": "release",
+        "version": version,
+        "release_tag": version,
+        "protocol_version": 1,
+        "supported_esp_idf": ">=5.5.0",
+        "commit": "0123456789abcdef",
+        "artifacts": [
+            {
+                "url": f"https://example.invalid/espectre-sdk-{version}.zip",
+                "format": "zip",
+                "filename": f"espectre-sdk-{version}.zip",
+            }
+        ],
+        "install_surfaces": {
+            "cmake": {
+                "entrypoint": "src/cpp/espectre_sources.cmake",
+                "optional_source_groups": [],
+            },
+            "esp_idf_component": {
+                "component_root": "src/cpp",
+                "cmake": "src/cpp/CMakeLists.txt",
+                "kconfig": "src/cpp/Kconfig.projbuild",
+            },
+        },
+    }
+
+    page = stage.render_page(manifest, "release")
+
+    assert f'data-sdk-stability="{expected_stability}"' in page
+    assert ('data-sdk-production-ready="false"' in page) is not production_ready
+
+
+def test_web_sdk_page_escapes_manifest_metadata() -> None:
+    stage = load_script("stage_web_sdk")
+    payload = '"><script>alert(1)</script>'
+    manifest = {
+        "channel": "release",
+        "version": payload,
+        "release_tag": payload,
+        "protocol_version": payload,
+        "supported_esp_idf": payload,
+        "commit": payload,
+        "artifacts": [{"url": f"https://example.invalid/{payload}", "format": "zip", "filename": payload}],
+        "install_surfaces": {
+            "cmake": {"entrypoint": payload, "optional_source_groups": [payload]},
+            "esp_idf_component": {
+                "component_root": payload,
+                "cmake": payload,
+                "kconfig": payload,
+            },
+        },
+    }
+
+    page = stage.render_page(manifest, "release")
+
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
+    assert "&quot;&gt;&lt;script&gt;" in page
+
+
+@pytest.mark.parametrize("artifact_url", ["javascript:alert(1)", "https:artifact.zip"])
+def test_web_sdk_manifest_rejects_unsafe_artifact_urls(artifact_url: str) -> None:
+    stage = load_script("stage_web_sdk")
+    manifest = {
+        "schema_version": 2,
+        "channel": "preview",
+        "version": "3.0.0-1-gabcdef1",
+        "release_tag": "snapshot",
+        "protocol_version": "1",
+        "supported_esp_idf": ">=5.5.0",
+        "commit": "abcdef1",
+        "artifacts": [{"url": artifact_url, "format": "zip", "filename": "sdk.zip"}],
+        "install_surfaces": {
+            "cmake": {"entrypoint": "src/cpp/espectre_sources.cmake", "optional_source_groups": []},
+            "esp_idf_component": {
+                "component_root": "src/cpp",
+                "cmake": "src/cpp/CMakeLists.txt",
+                "kconfig": "src/cpp/Kconfig.projbuild",
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="root-relative or HTTPS"):
+        stage.validate_sdk_manifest(manifest, "preview")
+
+
+@pytest.mark.parametrize("tag", ["v3.0.0", "03.0.0", "3.0.0-01", "3.0", "release"])
+def test_release_validator_rejects_non_semver_tags(tag: str) -> None:
+    validator = load_script("validate_release")
+    with pytest.raises(ValueError, match="semantic versioning"):
+        validator.validate(tag)
+
+
+def test_release_validator_requires_a_finalized_matching_changelog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validator = load_script("validate_release")
+    changelog = tmp_path / "CHANGELOG.md"
+    monkeypatch.setattr(validator, "CHANGELOG", changelog)
+    monkeypatch.setattr(validator, "detect_git_version", lambda **_kwargs: "3.0.0-rc1")
+
+    changelog.write_text("## [3.0.0-rc1] - Unreleased\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not finalized"):
+        validator.validate("3.0.0-rc1")
+
+    changelog.write_text("## [3.0.0-rc1] - 2026-08-12\n", encoding="utf-8")
+    validator.validate("3.0.0-rc1")
+
+
+def test_sdk_packaging_requires_a_stamped_identity(tmp_path: Path) -> None:
+    builder = load_script("build_sdk_package")
+    with pytest.raises(ValueError, match="Unable to detect ESPECTRE_SDK_VERSION_STRING"):
+        builder.detect_sdk_version()
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    with pytest.raises(ValueError, match="git describe failed"):
+        load_script("detect_git_version").detect_git_version(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("defines", "descriptor", "expected"),
+    [
+        ({}, "3.0.0-rc1", "3.0.0-rc1"),
+        ({"APP_PROJECT_VER": "idf-build"}, "2026.8.2", "idf-build"),
+        ({}, "2026.8.2", "2026.8.2"),
+        ({}, "", "unknown"),
+        ({}, None, "unknown"),
+    ],
+)
+def test_frontend_firmware_version(
+    tmp_path: Path, defines: dict[str, str], descriptor: str | None, expected: str,
+) -> None:
+    if descriptor is not None:
+        (tmp_path / "esp_app_desc.h").write_text(
+            'struct esp_app_desc_t { const char *version; };\n'
+            'inline const esp_app_desc_t *esp_app_get_description() {\n'
+            f'  static const esp_app_desc_t value = {{{json.dumps(descriptor)}}};\n'
+            '  return &value;\n}\n',
+            encoding="utf-8",
+        )
+    probe = tmp_path / "version.cpp"
+    probe.write_text(
+        '#include "frontend/frontend_firmware_version.h"\n'
+        '#include "runtime/espectre_sdk_version.h"\n'
+        '#include <string_view>\n'
+        'int main() {\n'
+        f'  return std::string_view(espectre::frontend_firmware_version()) == {json.dumps(expected)}\n'
+        '      && std::string_view(espectre::espectre_sdk_version()) == "0.0.0" ? 0 : 1;\n}\n',
+        encoding="utf-8",
+    )
+    cpp = REPO_ROOT / "src/cpp"
+    executable = tmp_path / "version"
+    subprocess.run(
+        ["c++", "-std=c++17", "-Werror", "-I", str(tmp_path), "-I", str(cpp),
+         *(f"-D{name}={json.dumps(value)}" for name, value in defines.items()),
+         str(cpp / "frontend/frontend_firmware_version.cpp"),
+         str(probe), "-o", str(executable)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("stamped", [None, "3.0.0-rc1"])
+@pytest.mark.parametrize("override", [None, "3.1.0-ci", "major_only", "string_only"])
+def test_sdk_version_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    stamped: str | None, override: str | None,
+) -> None:
+    builder = load_script("build_sdk_package")
+    cpp = tmp_path / "vendor/sdk/src/cpp"
+    (cpp / "runtime").mkdir(parents=True)
+    header = cpp / "runtime/espectre_sdk_version.h"
+    shutil.copyfile(REPO_ROOT / "src/cpp/runtime/espectre_sdk_version.h", header)
+    if stamped:
+        builder.stamp_sdk_version_header(header, stamped)
+        assert builder.detect_sdk_version(header) == stamped
+
+    # A vendored SDK keeps its own identity, even inside a tagged application.
+    for command in (
+        ["git", "init", "-q", str(tmp_path)],
+        ["git", "-C", str(tmp_path), "add", "."],
+        ["git", "-C", str(tmp_path), "-c", "user.name=Test", "-c",
+         "user.email=test@example.com", "-c", "commit.gpgsign=false",
+         "commit", "-qm", "Application fixture"],
+        ["git", "-C", str(tmp_path), "tag", "9.9.9"],
+    ):
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    monkeypatch.setenv("ESPECTRE_GIT_VERSION", "unrelated-firmware-version")
+    partial = override in ("major_only", "string_only")
+    expected = "0.0.0" if partial else override or stamped or "0.0.0"
+    major, minor, patch = builder.parse_version_core(expected)
+    source = (
+        '#include "runtime/espectre_sdk_version.h"\n'
+        '#include <string_view>\n'
+        f'static_assert(std::string_view(espectre::espectre_sdk_version()) == "{expected}");\n'
+        f'static_assert(ESPECTRE_SDK_VERSION_MAJOR == {major});\n'
+        f'static_assert(ESPECTRE_SDK_VERSION_MINOR == {minor});\n'
+        f'static_assert(ESPECTRE_SDK_VERSION_PATCH == {patch});\n'
+        f'static_assert(ESPECTRE_SDK_VERSION_NUMBER == {major * 10000 + minor * 100 + patch});\n'
+        f'#if !ESPECTRE_SDK_VERSION_AT_LEAST({major}, {minor}, {patch})\n'
+        '#error "SDK must satisfy its own numeric version"\n'
+        '#endif\n'
+        f'#if ESPECTRE_SDK_VERSION_AT_LEAST({major + 1}, 0, 0)\n'
+        '#error "SDK must not satisfy a newer release"\n'
+        '#endif\n'
+    )
+    command = ["c++", "-std=c++17", "-Werror", "-fsyntax-only", "-x", "c++", "-I", str(cpp), "-"]
+    if override == "major_only":
+        command.append("-DESPECTRE_SDK_VERSION_MAJOR=3")
+    elif override == "string_only":
+        command.append('-DESPECTRE_SDK_VERSION_STRING="3.1.0-ci"')
+    elif override:
+        command.extend([
+            f'-DESPECTRE_SDK_VERSION_STRING="{override}"',
+            f"-DESPECTRE_SDK_VERSION_MAJOR={major}",
+            f"-DESPECTRE_SDK_VERSION_MINOR={minor}",
+            f"-DESPECTRE_SDK_VERSION_PATCH={patch}",
+        ])
+    result = subprocess.run(
+        command, cwd=cpp, input=source, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_native_loop_processes_wifi_events_before_frontend_updates() -> None:
+    source = (
+        REPO_ROOT / "src" / "cpp" / "frontend" / "native" / "app" / "main" / "app_main.cpp"
+    ).read_text(encoding="utf-8")
+    loop = source[source.index("void espectre_loop_task") : source.index("bool init_wifi_station")]
+
+    assert loop.index("g_wifi_manager.loop();") < loop.index("g_frontend->loop();")
+
+
+def test_git_version_cmake_honors_environment(tmp_path: Path) -> None:
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("cmake is not installed")
+    script = tmp_path / "probe.cmake"
+    cmake_file = (REPO_ROOT / "src" / "cpp" / "espectre_git_version.cmake").as_posix()
+    script.write_text(
+        f'include("{cmake_file}")\n'
+        "if(NOT ESPECTRE_GIT_VERSION STREQUAL \"2.8.0-99-gdeadbee\")\n"
+        "  message(FATAL_ERROR \"got ${ESPECTRE_GIT_VERSION}\")\n"
+        "endif()\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["ESPECTRE_GIT_VERSION"] = "2.8.0-99-gdeadbee"
+    result = subprocess.run(
+        [cmake, "-P", str(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_detect_git_version_ignores_rolling_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    detector = load_script("detect_git_version")
+
+    def fake_run(command, **_kwargs):
+        assert command == list(detector.GIT_DESCRIBE_CMD)
+        class Result:
+            returncode = 0
+            stdout = "2.8.0-237-g7439944\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(detector.subprocess, "run", fake_run)
+    assert detector.detect_git_version() == "2.8.0-237-g7439944"
+    assert detector.parse_version_core("2.8.0-237-g7439944") == (2, 8, 0)
+    assert detector.parse_version_core("3.0.0-rc1") == (3, 0, 0)
+    with pytest.raises(ValueError, match="numeric MAJOR.MINOR.PATCH"):
+        detector.parse_version_core("preview")
+
+
+@pytest.mark.parametrize(("idf_version", "supported", "external_mqtt"), [
+    ("5.5.0", False, False),
+    ("5.5.1", False, False),
+    ("5.5.2", False, False),
+    ("5.5.3", True, False),
+    ("5.5.4", True, False),
+    ("5.5.5", True, False),
+    ("5.5.6", True, False),
+    ("6.0.0", True, True),
+    ("6.0.3", True, True),
+    ("6.1.0", True, True),
+])
+@pytest.mark.parametrize("mqtt_enabled", [False, True])
+def test_sdk_idf_and_mqtt_compatibility(idf_version, supported, external_mqtt, mqtt_enabled, monkeypatch):
+    from idf_component_tools.manifest import if_parser
+
+    manifest = yaml.safe_load((REPO_ROOT / "src/cpp/idf_component.yml").read_text())
+    dependencies = manifest["dependencies"]
+    assert SimpleSpec(dependencies["idf"]["version"]).match(Version(idf_version)) is supported
+    mqtt = dependencies["espressif/mqtt"]
+    # ESPHome pins this exact release; a newer requirement would conflict.
+    assert mqtt["version"] == "1.0.0"
+    assert mqtt["registry_url"] == "https://components.espressif.com"
+    monkeypatch.setattr(if_parser, "get_idf_version", lambda: idf_version)
+    monkeypatch.setitem(if_parser.KCONFIG_CONTEXT.get().sdkconfig, "ESPECTRE_SDK_ENABLE_MQTT", mqtt_enabled)
+    assert all(if_parser.parse_if_clause(rule["if"]).get_value()
+               for rule in mqtt["rules"]) is (external_mqtt and mqtt_enabled)
+
+
+@pytest.mark.parametrize("channel", ["preview", "develop"])
+@pytest.mark.parametrize(("source_version", "registry_base"), [
+    ("2.8.0-237-g7439944", "2.8.0-237-g7439944"),
+    ("3.0.0-rc2-4-g7439944", "3.0.0-rc2-4-g7439944"),
+    ("3.0.0-rc2", "3.0.0-rc2"),
+    ("3.0.0", "3.0.0-0-g7439944"),
+])
+def test_sdk_snapshot_stamps_git_describe_identity(
+    tmp_path: Path, channel: str, source_version: str, registry_base: str,
+) -> None:
+    builder = load_script("build_sdk_package")
+    preview_tag, develop_tag = _ota_release_tags()
+    release_tag = preview_tag if channel == "preview" else develop_tag
+    args = argparse.Namespace(
+        channel=channel,
+        version=source_version,
+        release_tag=release_tag,
+        output_dir=str(tmp_path),
+        component_output_dir=str(tmp_path / "registry" / "espectre"),
+        commit="7439944d441e9a8e485a1d610d99265d743e93f8",
+        source_date_epoch=1_800_000_000,
+        url_prefix=None,
+    )
+    manifest = builder.build_sdk_package(args)
+    manifest_path = tmp_path / f"sdk-manifest-{channel}.json"
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+    assert load_script("detect_git_version").version_from_sdk_dir(tmp_path) == args.version
+    assert load_script("stage_web_sdk").load_sdk_manifest(tmp_path) == manifest
+    assert manifest["schema_version"] == 2
+    assert manifest["version"] == source_version
+    assert "package_version" not in manifest
+    assert "sdk_version" not in manifest
+    assert manifest["release_tag"] == release_tag
+    component_manifest = yaml.safe_load(builder.IDF_COMPONENT_MANIFEST.read_text())
+    assert manifest["supported_esp_idf"] == component_manifest["dependencies"]["idf"]["version"]
+    assert manifest["artifacts"][0]["filename"] == f"espectre-sdk-{channel}.tar.gz"
+    assert f"/releases/download/{release_tag}/" in manifest["artifacts"][0]["url"]
+
+    zip_path = tmp_path / f"espectre-sdk-{channel}.zip"
+    with zipfile.ZipFile(zip_path) as archive:
+        header_name = next(name for name in archive.namelist() if name.endswith("/src/cpp/runtime/espectre_sdk_version.h"))
+        header = archive.read(header_name).decode("utf-8")
+        yml_name = next(name for name in archive.namelist() if name.endswith("/src/cpp/idf_component.yml"))
+        yml = archive.read(yml_name).decode("utf-8")
+        doxy_name = next(name for name in archive.namelist() if name.endswith("/src/cpp/Doxyfile"))
+        bundled_doxyfile = archive.read(doxy_name).decode("utf-8")
+    assert f'#define ESPECTRE_SDK_VERSION_STRING "{source_version}"' in header
+    assert f"#define ESPECTRE_SDK_VERSION_MAJOR {Version(source_version).major}" in header
+    assert "ESPectre SDK version is unresolved" not in header
+    assert f'version: "{source_version}"' in yml
+    source_manifest = builder.IDF_COMPONENT_MANIFEST.read_text(encoding="utf-8")
+    assert yml.split("\ndependencies:\n", 1)[1] == source_manifest.split("\ndependencies:\n", 1)[1]
+    assert yaml.safe_load(yml)["dependencies"]["idf"] == component_manifest["dependencies"]["idf"]
+    assert "espressif/mdns:" in yml
+    assert set(yaml.safe_load(yml)["dependencies"]) == {"idf", "espressif/mdns", "espressif/mqtt"}
+    assert re.search(rf"(?m)^PROJECT_NUMBER\s*=\s*{re.escape(source_version)}\s*$", bundled_doxyfile)
+
+    inventory_path = tmp_path / "registry" / "component-inventory.json"
+    inventory, files = load_script("verify_sdk_component").load_package(inventory_path)
+    registry_version = inventory["version"]
+    assert_sdk_registry_installation(files, registry_version,
+                                     "https://components-staging.espressif.com", tmp_path / "consumer")
+    branch = "main" if channel == "preview" else "develop"
+    assert registry_version == f"{registry_base}.{branch}"
+    assert f'#define ESPECTRE_SDK_VERSION_STRING "{registry_version}"'.encode() in files["API.md"]
+    assert args.commit.encode() in files["API.md"]
+    assert Version(registry_version).prerelease
+    assert SimpleSpec(f"=={registry_version}").match(Version(registry_version))
+    assert f'#define ESPECTRE_SDK_VERSION_STRING "{registry_version}"'.encode() in files[
+        "runtime/espectre_sdk_version.h"
+    ]
+    assert inventory["commit"] == args.commit
+    command = [sys.executable, str(SCRIPTS_DIR / "verify_sdk_component.py"), "check",
+               "--inventory", str(inventory_path), "--expected-commit", args.commit,
+               "--snapshot-channel"]
+    result = subprocess.run([*command, channel], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    other_channel = "develop" if channel == "preview" else "preview"
+    result = subprocess.run([*command, other_channel], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "snapshot channel" in result.stderr
+    command[-2] = "0" * 40
+    result = subprocess.run([*command, channel], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "source commit" in result.stderr
+    for relative_path in (
+        "src/cpp/frontend/native/espectre/idf_component.yml",
+        "src/cpp/frontend/matter/espectre/idf_component.yml",
+        "src/cpp/frontend/matter/app/main/idf_component.yml",
+    ):
+        frontend_manifest = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        idf_spec = yaml.safe_load(frontend_manifest)["dependencies"]["idf"]["version"]
+        assert SimpleSpec(idf_spec).match(Version(IDF_VERSION))
+
+    native_manifest = (
+        REPO_ROOT / "src" / "cpp" / "frontend" / "native" / "espectre" / "idf_component.yml"
+    ).read_text(encoding="utf-8")
+    assert 'improv/improv:\n    version: "1.2.7"' in native_manifest
+    assert "git:" not in native_manifest
+    assert "espressif/mdns:" in native_manifest
+
+    for relative_path in (
+        "src/cpp/frontend/native/espectre/idf_component.yml",
+        "src/cpp/frontend/esphome/components/espectre/idf_component.yml",
+    ):
+        frontend_manifest = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "espressif/esp_tinyusb:" in frontend_manifest
+        assert '- if: "target == esp32s2"' in frontend_manifest
+
+    matter_manifest = (
+        REPO_ROOT / "src" / "cpp" / "frontend" / "matter" / "espectre" / "idf_component.yml"
+    ).read_text(encoding="utf-8")
+    assert 'improv/improv:\n    version: "1.2.7"' in matter_manifest
+    assert "git:" not in matter_manifest
+    assert "espressif/mdns:" in matter_manifest
+    assert "espressif/esp_tinyusb:" not in matter_manifest
+    assert "esp32s2" not in matter_manifest
+    for relative_path in (
+        "src/cpp/frontend/matter/app/main/idf_component.yml",
+        "src/cpp/frontend/esphome/components/espectre/idf_component.yml",
+    ):
+        assert "improv" not in (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    assert not (
+        REPO_ROOT / "src" / "cpp" / "frontend" / "matter" / "app" / "sdkconfig.defaults.esp32s2"
+    ).exists()
+
+
+def test_release_sdk_rejects_a_version_tag_mismatch(tmp_path: Path) -> None:
+    builder = load_script("build_sdk_package")
+    args = argparse.Namespace(
+        channel="release",
+        version="3.0.0-rc1",
+        release_tag="3.0.0",
+        output_dir=str(tmp_path),
+        commit="0123456789abcdef",
+        source_date_epoch=1_800_000_000,
+        url_prefix=None,
+    )
+
+    with pytest.raises(ValueError, match="Release SDK version and release tag must match"):
+        builder.build_sdk_package(args)
+
+
+def test_release_firmware_rejects_a_version_tag_mismatch(tmp_path: Path) -> None:
+    builder = load_script("build_firmware_manifest")
+    firmware_dir = tmp_path / "firmware"
+    output = tmp_path / "firmware-manifest-release.json"
+    firmware_dir.mkdir()
+    args = argparse.Namespace(
+        firmware_dir=str(firmware_dir),
+        output=str(output),
+        channel="release",
+        version="3.0.0-rc1",
+        release_tag="3.0.0",
+        commit="0123456789abcdef",
+        url_prefix=None,
+    )
+
+    with pytest.raises(ValueError, match="Release firmware version and release tag must match"):
+        builder.build_manifest(args)
+    assert not output.exists()
+
+
+def test_local_release_staging_uses_the_build_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS_DIR))
+    stager = importlib.import_module("stage_web_firmware")
+    existing = {"release_tag": "3.0.0-rc1"}
+
+    assert (
+        stager.resolve_local_release_tag(
+            "release",
+            "2.8.0-408-ga7d5d0a",
+            None,
+            existing,
+        )
+        == "2.8.0-408-ga7d5d0a"
+    )
+    assert stager.resolve_local_release_tag("preview", "snapshot", None, existing) == "3.0.0-rc1"
+    assert stager.resolve_local_release_tag("release", "snapshot", "override", existing) == "override"
+
+
+def test_local_staging_discovers_nested_esphome_builds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS_DIR))
+    stager = importlib.import_module("stage_web_firmware")
+    build_root = tmp_path / "build"
+    for chip in ("esp32", "esp32c3"):
+        artifact_dir = build_root / f"espectre-{chip}" / "espectre" / "build"
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "firmware.factory.bin").write_bytes(chip.encode("utf-8"))
+        (artifact_dir / "project_description.json").write_text(
+            json.dumps({"target": chip}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(stager, "ESPHOME_BUILD_ROOT", build_root)
+
+    images = stager.discover_esphome_images(None)
+
+    assert [(image.frontend, image.chip) for image in images] == [
+        ("esphome", "esp32"),
+        ("esphome", "esp32c3"),
+    ]
+
+
+def test_web_firmware_staging_validates_before_cleaning_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS_DIR))
+    stager = importlib.import_module("stage_web_firmware")
+    firmware_dir = tmp_path / "firmware"
+    output_dir = tmp_path / "output"
+    firmware_dir.mkdir()
+    output_dir.mkdir()
+    existing = output_dir / "espectre-native-3.0.0-esp32s3.bin"
+    existing.write_bytes(b"existing firmware")
+    args = argparse.Namespace(
+        firmware_dir=str(firmware_dir),
+        output_dir=str(output_dir),
+        channel="release",
+        version="3.0.0-rc1",
+        release_tag="3.0.0",
+        commit="0123456789abcdef",
+        url_prefix="/artifacts/firmware/release",
+    )
+
+    with pytest.raises(ValueError, match="Release firmware version and release tag must match"):
+        stager.stage_web_firmware(args)
+    assert existing.read_bytes() == b"existing firmware"
+
+
+def test_generate_sdk_api_stamps_a_working_copy_without_mutating_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    generator = load_script("generate_sdk_api")
+    repo_doxyfile = (REPO_ROOT / "src" / "cpp" / "Doxyfile").read_text(encoding="utf-8")
+    stamped_versions: list[str] = []
+    api_output = tmp_path / "sdk" / "api"
+    api_output.mkdir(parents=True)
+    stale_page = api_output / "stale-internal-type.html"
+    stale_page.write_text("stale", encoding="utf-8")
+
+    def stamped_output(path: Path) -> Path:
+        source = path.read_text(encoding="utf-8")
+        match = re.search(r"(?m)^OUTPUT_DIRECTORY\s*=\s*(\S+)\s*$", source)
+        assert match is not None
+        return Path(match.group(1))
+
+    def fake_doxygen(path: Path) -> None:
+        stamped = path.read_text(encoding="utf-8")
+        match = re.search(r"(?m)^PROJECT_NUMBER\s*=\s*(\S+)\s*$", stamped)
+        assert match is not None
+        stamped_versions.append(match.group(1))
+        xml = stamped_output(path) / "xml"
+        xml.mkdir(parents=True)
+        (xml / "index.xml").write_text(
+            '<doxygenindex version="1.17">'
+            '<compound refid="classespectre_1_1_runtime_frontend_controller" kind="class"><name>espectre::RuntimeFrontendController</name></compound>'
+            '<compound refid="espectre__sdk__version_8h" kind="file"><name>espectre_sdk_version.h</name></compound>'
+            '<compound refid="integration" kind="page"><name>integration</name></compound>'
+            "</doxygenindex>",
+            encoding="utf-8",
+        )
+        (xml / "classespectre_1_1_runtime_frontend_controller.xml").write_text(
+            '<doxygen><compounddef><sectiondef kind="private-func"><memberdef prot="private" kind="function"/></sectiondef></compounddef></doxygen>',
+            encoding="utf-8",
+        )
+        (xml / "espectre__sdk__version_8h.xml").write_text(
+            '<doxygen><compounddef kind="file"><location file="src/cpp/runtime/espectre_sdk_version.h"/></compounddef></doxygen>'
+        )
+        (xml / "integration.xml").write_text(
+            '<doxygen><compounddef kind="page"><title>Integration title</title></compounddef></doxygen>'
+        )
+        (xml / "integration_8dox.xml").write_text(
+            '<doxygen><compounddef kind="file"><location file="src/cpp/sdk_integration.dox"/></compounddef></doxygen>'
+        )
+
+    def fake_mcss(path: Path, _root: Path | None) -> None:
+        output = stamped_output(path)
+        assert 'prot="private"' not in (
+            output / "xml" / "classespectre_1_1_runtime_frontend_controller.xml"
+        ).read_text(encoding="utf-8")
+        rendered = output / "rendered"
+        rendered.mkdir()
+        (rendered / "index.html").write_text(
+            '<article data-api-reference-fragment="index">'
+            '<a href="classespectre_1_1_runtime_frontend_controller.html" '
+            'onclick="return toggle(this)">Controller</a>'
+            '<script>function toggle() { return false; }</script>'
+            '</article>',
+            encoding="utf-8",
+        )
+        (rendered / "classespectre_1_1_runtime_frontend_controller.html").write_text(
+            '<article data-api-reference-fragment="classespectre_1_1_runtime_frontend_controller"><h1>Controller</h1><nav class="m-block m-default"><h3>Local navigation</h3></nav><section id="members"><h2>Members</h2></section></article>',
+            encoding="utf-8",
+        )
+        (rendered / "files.html").write_text(
+            '<article data-api-reference-fragment="files"><h1>Files</h1></article>',
+            encoding="utf-8",
+        )
+        (rendered / "espectre__sdk__version_8h.html").write_text(
+            '<article data-api-reference-fragment="espectre__sdk__version_8h"><section class="m-doc-details">Version defines</section></article>',
+            encoding="utf-8",
+        )
+        for refid in ("integration", "integration_8dox"):
+            (rendered / f"{refid}.html").write_text('<article>Integration</article>')
+
+    monkeypatch.setattr(generator, "run_doxygen", fake_doxygen)
+    monkeypatch.setattr(generator, "run_mcss", fake_mcss)
+    monkeypatch.setattr(generator, "API_OUTPUT_DIR", api_output)
+    monkeypatch.setattr(generator, "expected_header_paths", lambda: {"runtime/espectre_sdk_version.h"})
+    commit = "a" * 40
+    version = generator.generate_sdk_api("3.0.0-12-gabcdef1", commit=commit)
+    assert version == "3.0.0-12-gabcdef1"
+    assert stamped_versions == ["3.0.0-12-gabcdef1"]
+    assert not stale_page.exists()
+    manifest = json.loads((api_output / "api-index.json").read_text(encoding="utf-8"))
+    assert manifest["sdk_version"] == "3.0.0-12-gabcdef1"
+    assert manifest["source_commit"] == commit
+    assert manifest["public_headers"] == ["runtime/espectre_sdk_version.h"]
+    assert manifest["renderer"] == "m.css"
+    entries = {entry["refid"]: entry for entry in manifest["entries"]}
+    assert entries["integration"]["name"] == "Integration title"
+    assert entries["index"]["discoverable"] is True
+    assert entries["classespectre_1_1_runtime_frontend_controller"]["discoverable"] is True
+    assert entries["files"]["discoverable"] is False
+    assert entries["espectre__sdk__version_8h"]["discoverable"] is True
+    controller_fragment = (
+        api_output / "fragments" / "classespectre_1_1_runtime_frontend_controller.html"
+    ).read_text(encoding="utf-8")
+    assert '<nav class="m-block' not in controller_fragment
+    assert '<section id="members">' in controller_fragment
+    index_fragment = (api_output / "fragments" / "index.html").read_text(encoding="utf-8")
+    assert "onclick=" not in index_fragment
+    assert "<script" not in index_fragment
+    assert 'href="/sdk/api/?api=classespectre_1_1_runtime_frontend_controller"' in index_fragment
+    generator.generate_sdk_api("3.1.0", commit=commit)
+    current = json.loads((api_output / "api-index.json").read_text(encoding="utf-8"))
+    assert current["sdk_version"] == "3.1.0"
+    assert {path.relative_to(api_output).as_posix() for path in api_output.rglob("*") if path.is_file()} == {
+        "api-index.json", *(entry["fragment"] for entry in current["entries"]),
+    }
+    monkeypatch.setattr(generator, "expected_header_paths", lambda: {"runtime/missing.h"})
+    with pytest.raises(ValueError, match="missing public headers"):
+        generator.generate_sdk_api("3.2.0", commit=commit)
+    assert (REPO_ROOT / "src" / "cpp" / "Doxyfile").read_text(encoding="utf-8") == repo_doxyfile
+    assert re.search(r"(?m)^PROJECT_NUMBER\s*=\s*UNSTAMPED\s*$", repo_doxyfile)
+
+
+def test_sdk_bundle_rewrites_the_repo_doxyfile_preamble(tmp_path: Path) -> None:
+    packager = load_script("build_sdk_package")
+    bundled = tmp_path / "Doxyfile"
+    bundled.write_text((REPO_ROOT / "src" / "cpp" / "Doxyfile").read_text(encoding="utf-8"))
+    packager.rewrite_bundle_doxyfile(bundled, "3.0.0")
+    rewritten = bundled.read_text(encoding="utf-8")
+    assert "# Usage, from the unpacked SDK bundle root:" in rewritten
+    assert re.search(r"(?m)^OUTPUT_DIRECTORY\s*=\s*output\s*$", rewritten)
+    assert re.search(r"(?m)^PROJECT_NUMBER\s*=\s*3\.0\.0\s*$", rewritten)
+
+
+def test_generate_sdk_api_requires_the_pinned_doxygen_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = load_script("generate_sdk_api")
+    required_version = generator.REQUIRED_DOXYGEN_VERSION
+    major, minor, patch = map(int, required_version.split("."))
+    other_version = f"{major}.{minor}.{patch + 1}"
+    monkeypatch.setattr(generator, "detect_doxygen_version", lambda: other_version)
+    with pytest.raises(ValueError, match=re.escape(required_version)):
+        generator.require_doxygen_version()
+    monkeypatch.setattr(generator, "detect_doxygen_version", lambda: required_version)
+    generator.require_doxygen_version()
+
+
+def test_sdk_api_fragment_security_rejects_active_markup() -> None:
+    security = load_script("web_html_security")
+    for fragment in (
+        '<article><iframe src="https://example.com"></iframe></article>',
+        '<article><a href="javascript:alert(1)">unsafe</a></article>',
+        '<article><a href="//example.com/unsafe">unsafe</a></article>',
+        '<article style="background: url(https://example.com)">unsafe</article>',
+    ):
+        with pytest.raises(ValueError, match="unsafe"):
+            security.passivize_api_fragment(fragment)
+
+
+@pytest.mark.parametrize("script", [
+    '<script>alert(1)</script>',
+    '<SCRIPT>alert(1)</SCRIPT>',
+    '<script data-label=">">alert(1)</script>',
+    '<script>alert(1)</script\t\n bar>',
+    '<script src="https://example.com/script.js"/>',
+])
+def test_sdk_api_fragment_removes_script_elements(script: str) -> None:
+    security = load_script("web_html_security")
+    fragment = f'<article>before\n{script}<code>&lt;script&gt;</code>after</article>'
+    assert security.passivize_api_fragment(fragment) == (
+        '<article>before\n<code>&lt;script&gt;</code>after</article>'
+    )
+
+
+def test_sdk_api_fragment_rejects_unclosed_script() -> None:
+    security = load_script("web_html_security")
+    with pytest.raises(ValueError, match="unsafe HTML tag: script"):
+        security.passivize_api_fragment('<article><script>alert(1)')
+
+
+def test_indexnow_retries_transient_failures_and_sends_the_sitemap(tmp_path: Path) -> None:
+    indexnow = load_script("notify_indexnow")
+    sitemap = tmp_path / "sitemap.xml"
+    sitemap.write_text(
+        '<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<url><loc>https://espectre.dev/</loc></url>"
+        "<url><loc>https://espectre.dev/sdk/</loc></url></urlset>",
+        encoding="utf-8",
+    )
+    urls = indexnow.sitemap_urls(sitemap)
+    calls: list[tuple[object, float]] = []
+    sleeps: list[float] = []
+
+    class Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    def request(request, *, timeout):
+        calls.append((request, timeout))
+        if len(calls) < 3:
+            raise OSError("temporary failure")
+        return Response()
+
+    indexnow.notify(urls, request_fn=request, sleep_fn=sleeps.append, timeout=7.5)
+
+    assert len(calls) == 3
+    assert sleeps == [1.0, 2.0]
+    assert all(timeout == 7.5 for _, timeout in calls)
+    payload = json.loads(calls[-1][0].data)
+    assert payload["host"] == "espectre.dev"
+    assert payload["urlList"] == urls
+
+
+def test_sitemap_lastmod_dates_use_utc() -> None:
+    sitemap_builder = load_script("build_sitemap")
+    assert sitemap_builder.normalized_date("2026-08-19T00:41:27+02:00") == "2026-08-18"
+    assert sitemap_builder.normalized_date("2026-08-18T23:30:00Z") == "2026-08-18"
+    assert sitemap_builder.normalized_date("2026-08-19T00:00:00+00:00") == "2026-08-19"
+    assert sitemap_builder.normalized_date("2026-08-19") == "2026-08-19"
+
+
+def test_sitemap_builder_uses_git_and_sdk_manifest_dates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sitemap_builder = load_script("build_sitemap")
+    web_root = tmp_path / "web"
+    release_dir = web_root / "artifacts" / "sdk" / "release"
+    preview_dir = web_root / "artifacts" / "sdk" / "preview"
+    develop_dir = web_root / "artifacts" / "sdk" / "develop"
+    release_dir.mkdir(parents=True)
+    preview_dir.mkdir(parents=True)
+    develop_dir.mkdir(parents=True)
+    (release_dir / "sdk-manifest-release.json").write_text(
+        json.dumps({"channel": "release", "generated_at": "2026-08-01T09:30:00Z"}),
+        encoding="utf-8",
+    )
+    (preview_dir / "sdk-manifest-preview.json").write_text(
+        json.dumps({"channel": "preview", "generated_at": "2026-08-12T10:45:00+00:00"}),
+        encoding="utf-8",
+    )
+    (develop_dir / "sdk-manifest-develop.json").write_text(
+        json.dumps({"channel": "develop", "generated_at": "2026-08-14T11:15:00+00:00"}),
+        encoding="utf-8",
+    )
+    for channel_dir in (release_dir, preview_dir, develop_dir):
+        (channel_dir / "index.html").write_text("<main></main>", encoding="utf-8")
+    monkeypatch.setattr(sitemap_builder, "WEB_ROOT", web_root)
+
+    def fake_git_date(paths):
+        if paths == sitemap_builder.SDK_CHANNEL_PAGE_INPUTS:
+            return "2026-08-10"
+        if sitemap_builder.DOXYFILE in paths:
+            return "2026-08-08"
+        return "2026-08-09"
+
+    monkeypatch.setattr(sitemap_builder, "latest_git_date", fake_git_date)
+    output = tmp_path / "generated.xml"
+    sitemap_builder.build_sitemap(output)
+
+    root = ET.parse(output).getroot()
+    namespace = {"s": sitemap_builder.SITEMAP_NAMESPACE}
+    entries = {
+        entry.findtext("s:loc", namespaces=namespace): entry.findtext("s:lastmod", namespaces=namespace)
+        for entry in root.findall("s:url", namespace)
+    }
+    assert {url: entries[url] for url in (
+        "https://espectre.dev/",
+        "https://espectre.dev/sdk/api/",
+        "https://espectre.dev/artifacts/sdk/release/",
+        "https://espectre.dev/artifacts/sdk/preview/",
+        "https://espectre.dev/artifacts/sdk/develop/",
+    )} == {
+        "https://espectre.dev/": "2026-08-09",
+        "https://espectre.dev/sdk/api/": "2026-08-08",
+        "https://espectre.dev/artifacts/sdk/release/": "2026-08-10",
+        "https://espectre.dev/artifacts/sdk/preview/": "2026-08-12",
+        "https://espectre.dev/artifacts/sdk/develop/": "2026-08-14",
+    }
+    assert root.findall("s:url/s:changefreq", namespace) == []
+
+    expected_urls = {
+        f"{sitemap_builder.SITE_ORIGIN}{route['staticPath']}"
+        for route in sitemap_builder.ROUTE_MANIFEST["routes"]
+    } | {
+        f"{sitemap_builder.SITE_ORIGIN}{channel['path']}"
+        for channel in sitemap_builder.ROUTE_MANIFEST["sdkChannels"]
+    }
+    assert entries.keys() == expected_urls
+
+
+def test_sitemap_omits_unstaged_sdk_channels_and_rejects_partial_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sitemap_builder = load_script("build_sitemap")
+    web_root = tmp_path / "web"
+    monkeypatch.setattr(sitemap_builder, "WEB_ROOT", web_root)
+    output = tmp_path / "generated.xml"
+    sitemap_builder.build_sitemap(output)
+    urls = {
+        element.text
+        for element in ET.parse(output).getroot().findall(
+            f"{{{sitemap_builder.SITEMAP_NAMESPACE}}}url/"
+            f"{{{sitemap_builder.SITEMAP_NAMESPACE}}}loc"
+        )
+    }
+    assert not any("/artifacts/sdk/" in str(url) for url in urls)
+
+    release_dir = web_root / "artifacts" / "sdk" / "release"
+    release_dir.mkdir(parents=True)
+    (release_dir / "sdk-manifest-release.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="Incomplete staged SDK channel release"):
+        sitemap_builder.build_sitemap(output)
+
+
+def test_pages_build_outputs_do_not_overlap_committed_sources() -> None:
+    static_pages = load_script("build_static_pages")
+    sitemap_builder = load_script("build_sitemap")
+    source_paths = set(
+        subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                ".github/scripts",
+                "docs/web",
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
+    source_paths.difference_update(
+        subprocess.run(
+            ["git", "ls-files", "--deleted", "docs/web"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
+    generated_paths = {
+        "docs/web/artifacts",
+        "docs/web/node_modules",
+        "docs/web/sitemap.xml",
+        "docs/web/vendor",
+        *(
+            f"docs/web/{page['output'].strip('/')}"
+            for page in static_pages.PAGES
+        ),
+    }
+
+    assert sitemap_builder.DEFAULT_SITEMAP_OUTPUT == (
+        REPO_ROOT / "docs" / "web" / "sitemap.xml"
+    )
+    assert "docs/web/routes.json" in source_paths
+    for generated_path in generated_paths:
+        assert not any(
+            path == generated_path or path.startswith(f"{generated_path}/")
+            for path in source_paths
+        ), f"Pages build output overlaps committed source: {generated_path}"
+
+
+def test_pages_verifier_spa_routes_match_the_route_registry() -> None:
+    verifier = load_script("verify_web_build")
+    verifier.verify_spa_routes()
+
+
+def test_pages_verifier_requires_api_reference_to_show_sdk_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = load_script("verify_web_build")
+    monkeypatch.setattr(verifier, "WEB_ROOT", tmp_path)
+    version = "2.8.0-237-g7439944"
+    monkeypatch.setattr(verifier, "detect_git_version", lambda: version)
+    api = tmp_path / "artifacts" / "sdk" / "api"
+    fragments = api / "fragments"
+    fragments.mkdir(parents=True)
+    refids = (
+        "classespectre_1_1_runtime_frontend_controller",
+        "structespectre_1_1_runtime_config",
+        "classespectre_1_1_i_runtime_listener",
+    )
+    entries = []
+    for refid in refids:
+        fragment = f"fragments/{refid}.html"
+        (api / fragment).write_text("<article>API reference</article>", encoding="utf-8")
+        entries.append({"refid": refid, "fragment": fragment, "discoverable": True})
+    manifest = {
+        "schema_version": 1,
+        "sdk_version": version,
+        "source_commit": "a" * 40,
+        "public_headers": sorted(verifier.expected_header_paths()),
+        "renderer": "m.css",
+        "renderer_revision": "0123456789abcdef",
+        "default": refids[0],
+        "entries": entries,
+    }
+    manifest_path = api / "api-index.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    verifier.verify_sdk_api_version()
+    extra = api / "previous-build" / "api-index.json"
+    extra.parent.mkdir()
+    extra.write_text("{}")
+    with pytest.raises(ValueError, match="current page inventory"):
+        verifier.verify_sdk_api_version()
+    extra.unlink()
+    extra.parent.rmdir()
+    for key, value, message in (
+        ("source_commit", "short-sha", "full source commit"),
+        ("schema_version", 2, "Unsupported SDK API reference schema"),
+        ("default", "missing-page", "no default page"),
+    ):
+        original = manifest[key]
+        manifest[key] = value
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            verifier.verify_sdk_api_version()
+        manifest[key] = original
+    original_fragment = entries[0]["fragment"]
+    entries[0]["fragment"] = "../escape.html"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="fragment paths"):
+        verifier.verify_sdk_api_version()
+    entries[0]["fragment"] = original_fragment
+    manifest["public_headers"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not cover the public headers"):
+        verifier.verify_sdk_api_version()
+    manifest["sdk_version"] = "UNSTAMPED"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not show version"):
+        verifier.verify_sdk_api_version()
+
+
+def test_pages_verifier_rejects_missing_spa_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = load_script("verify_web_build")
+    monkeypatch.setattr(verifier, "WEB_ROOT", tmp_path)
+    monkeypatch.setattr(verifier, "ROUTE_MANIFEST", {
+        "routes": [
+            {"name": "home", "staticPath": "/"},
+            {"name": "device", "staticPath": "/device/"},
+        ]
+    })
+    (tmp_path / "index.html").write_text('<main data-page="home"></main>', encoding="utf-8")
+    with pytest.raises(ValueError, match=r"missing=\['device'\]"):
+        verifier.verify_spa_routes()
+
+
+def test_pages_verifier_requires_every_registered_static_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = load_script("verify_web_build")
+    monkeypatch.setattr(verifier, "WEB_ROOT", tmp_path)
+    monkeypatch.setattr(verifier, "ROUTE_MANIFEST", {
+        "siteOrigin": "https://espectre.dev",
+        "routes": [
+            {
+                "name": "guides", "staticPath": "/guides/",
+                "title": "Guides | ESPectre", "description": "Guides",
+            },
+            {
+                "name": "guide-home-assistant", "staticPath": "/guides/home-assistant/",
+                "title": "Home Assistant | ESPectre", "description": "Home Assistant",
+            },
+        ]
+    })
+    guides_dir = tmp_path / "guides"
+    guides_dir.mkdir()
+    (guides_dir / "index.html").write_text("<main></main>", encoding="utf-8")
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="guides/home-assistant/index.html",
+    ):
+        verifier.verify_generated_pages()
+
+
+def test_static_page_builder_escapes_and_verifies_route_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    static_pages = load_script("build_static_pages")
+    verifier = load_script("verify_web_build")
+    title = 'A "quoted" <route> | ESPectre'
+    description = 'Use "Direct" safely & keep <metadata> intact.'
+    spec = {
+        **static_pages.PAGES[0],
+        "name": "quoted",
+        "source": "content/quoted.html",
+        "output": "quoted",
+        "title": title,
+        "description": description,
+    }
+    content = tmp_path / "content"
+    content.mkdir()
+    (content / "quoted.html").write_text("<article><h1>Quoted</h1></article>", encoding="utf-8")
+    monkeypatch.setattr(static_pages, "WEB_ROOT", tmp_path)
+    monkeypatch.setattr(static_pages, "PAGES", (spec,))
+    monkeypatch.setattr(static_pages, "asset_version", lambda _path: "0123456789ab")
+    static_pages.build()
+
+    route = {
+        "name": "quoted",
+        "staticPath": "/quoted/",
+        "title": title,
+        "description": description,
+    }
+    monkeypatch.setattr(verifier, "WEB_ROOT", tmp_path)
+    monkeypatch.setattr(verifier, "ROUTE_MANIFEST", {
+        "siteOrigin": "https://espectre.dev",
+        "routes": [route],
+    })
+    verifier.verify_generated_pages()
+    generated = (tmp_path / "quoted" / "index.html").read_text(encoding="utf-8")
+    assert '&quot;Direct&quot;' in generated
+    assert "&lt;metadata&gt;" in generated
+
+
+def test_generated_pages_have_sitemap_lastmod_ownership() -> None:
+    static_pages = load_script("build_static_pages")
+    sitemap_builder = load_script("build_sitemap")
+    verifier = load_script("verify_web_build")
+
+    sitemap_paths = {urlparse(url).path for url in sitemap_builder.public_urls()}
+    generated_pages = {
+        f"/{page['output'].strip('/')}/": Path("docs/web") / page["source"]
+        for page in static_pages.PAGES
+    }
+
+    assert len(generated_pages) == len(static_pages.PAGES), "Generated page routes must be unique"
+    assert not generated_pages.keys() - sitemap_paths, (
+        "Generated pages missing from the sitemap: "
+        f"{sorted(generated_pages.keys() - sitemap_paths)}"
+    )
+    assert sitemap_paths == verifier.expected_sitemap_paths()
+
+    for route, source in generated_pages.items():
+        assert route in sitemap_builder.ROUTE_SOURCES, (
+            f"Generated page {route} has no sitemap lastmod ownership mapping"
+        )
+        ownership = sitemap_builder.ROUTE_SOURCES[route]
+        assert source in ownership, f"Sitemap lastmod for {route} does not track {source}"
+        assert sitemap_builder.STATIC_PAGE_BUILDER in ownership, (
+            f"Sitemap lastmod for {route} does not track the static page builder"
+        )
+        assert sitemap_builder.WEB_PAGE_SHELL in ownership, (
+            f"Sitemap lastmod for {route} does not track the shared page shell"
+        )
+        assert sitemap_builder.ROUTE_BOOTSTRAP in ownership, (
+            f"Sitemap lastmod for {route} does not track the route bootstrap"
+        )
+
+    assert sitemap_builder.SDK_API_BUILDER in sitemap_builder.SDK_API_INPUTS
+    assert sitemap_builder.MCSS_TEMPLATES in sitemap_builder.SDK_API_INPUTS
+
+
+def test_sitemap_verifier_requires_accurate_dates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = load_script("verify_web_build")
+    monkeypatch.setattr(verifier, "WEB_ROOT", tmp_path)
+    namespace = verifier.SITEMAP_NAMESPACE
+    expected_paths = verifier.expected_sitemap_paths()
+    entries = "".join(
+        f"<url><loc>https://espectre.dev{path}</loc>"
+        + "<lastmod>2026-08-12</lastmod>"
+        + "</url>"
+        for path in sorted(expected_paths)
+    )
+    sitemap = tmp_path / "sitemap.xml"
+    sitemap.write_text(
+        f'<?xml version="1.0"?><urlset xmlns="{namespace}">{entries}</urlset>',
+        encoding="utf-8",
+    )
+    valid_source = sitemap.read_text(encoding="utf-8")
+    verifier.verify_sitemap(require_preview=False, require_release=False, require_develop=False)
+
+    future = valid_source.replace(
+        "<lastmod>2026-08-12</lastmod>",
+        "<lastmod>2099-01-01</lastmod>",
+        1,
+    )
+    sitemap.write_text(future, encoding="utf-8")
+    with pytest.raises(ValueError, match="lastmod is in the future"):
+        verifier.verify_sitemap(require_preview=False, require_release=False, require_develop=False)
+    sitemap.write_text(
+        future.replace("<lastmod>2099-01-01</lastmod>", "<lastmod>2026-08-12</lastmod>", 1),
+        encoding="utf-8",
+    )
+
+    source = sitemap.read_text(encoding="utf-8").replace(
+        "<lastmod>2026-08-12</lastmod>",
+        "<lastmod>2026-08-12</lastmod><changefreq>daily</changefreq>",
+        1,
+    )
+    sitemap.write_text(source, encoding="utf-8")
+    with pytest.raises(ValueError, match="must not contain changefreq"):
+        verifier.verify_sitemap(require_preview=False, require_release=False, require_develop=False)
+
+    sitemap.write_text(
+        valid_source.replace("<lastmod>2026-08-12</lastmod>", "", 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing lastmod"):
+        verifier.verify_sitemap(require_preview=False, require_release=False, require_develop=False)
+
+
+def test_pages_verifier_enforces_exact_artifact_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, firmware_trust
+) -> None:
+    verifier = load_script("verify_web_build")
+    monkeypatch.setattr(verifier, "WEB_ROOT", tmp_path)
+    firmware_dir = tmp_path / "artifacts" / "firmware" / "preview"
+    sdk_dir = tmp_path / "artifacts" / "sdk" / "preview"
+    firmware_dir.mkdir(parents=True)
+    sdk_dir.mkdir(parents=True)
+
+    frontends = {}
+    for frontend in sorted(verifier.EXPECTED_FRONTENDS):
+        artifacts = []
+        for chip in sorted(verifier.EXPECTED_CHIPS_BY_FRONTEND[frontend]):
+            filename = f"espectre-{frontend}-{chip}.bin"
+            (firmware_dir / filename).write_bytes(b"firmware")
+            artifacts.append({"build_type": "factory", "chip": chip, "chip_family": chip, "filename": filename,
+                              "size": 8, "sha256": hashlib.sha256(b"firmware").hexdigest()})
+        frontends[frontend] = {"artifacts": artifacts}
+    firmware_manifest = {
+        "channel": "preview",
+        "version": "3.0.0-rc1-12-gabcdef1",
+        "frontends": frontends,
+    }
+    firmware_manifest_path = firmware_dir / "firmware-manifest-preview.json"
+    signing, key = firmware_trust
+    signing.sign_manifest(firmware_manifest, key)
+    firmware_manifest_path.write_text(json.dumps(firmware_manifest), encoding="utf-8")
+    verifier.verify_firmware_channel("preview")
+
+    firmware_manifest["version"] = "2.8.0-434-g2a4cfc8"
+    firmware_manifest_path.write_text(json.dumps(firmware_manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="version 3 or newer"):
+        verifier.verify_firmware_channel("preview")
+    firmware_manifest["version"] = "3.0.0-rc1-12-gabcdef1"
+
+    frontends["native"]["artifacts"].append(frontends["native"]["artifacts"][0])
+    firmware_manifest_path.write_text(json.dumps(firmware_manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate firmware"):
+        verifier.verify_firmware_channel("preview")
+
+    (sdk_dir / "index.html").write_text("SDK", encoding="utf-8")
+    sdk_manifest_path = sdk_dir / "sdk-manifest-preview.json"
+    sdk_manifest = {
+        "schema_version": 2,
+        "channel": "preview",
+        "version": "3.0.0-rc1-12-gabcdef1",
+        "release_tag": "snapshot",
+        "artifacts": [
+            {"format": "tar.gz", "sha256": "a" * 64},
+            {"format": "zip", "sha256": "b" * 64},
+        ],
+    }
+    sdk_manifest_path.write_text(json.dumps(sdk_manifest), encoding="utf-8")
+    verifier.verify_sdk_channel("preview")
+    sdk_manifest["version"] = "2.8.0"
+    sdk_manifest_path.write_text(json.dumps(sdk_manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="version 3 or newer"):
+        verifier.verify_sdk_channel("preview")
+    sdk_manifest["version"] = "3.0.0-rc1-12-gabcdef1"
+    sdk_manifest["artifacts"][0]["sha256"] = "invalid"
+    sdk_manifest_path.write_text(json.dumps(sdk_manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256"):
+        verifier.verify_sdk_channel("preview")
+
+    with pytest.raises(ValueError, match="escapes"):
+        verifier.require_file("../outside")
+
+
+def test_workflows_keep_publication_and_supply_chain_guardrails() -> None:
+    workflow_sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(WORKFLOWS_DIR.glob("*.yml"))
+    }
+    combined = "\n".join(workflow_sources.values())
+    assert "ubuntu-latest" not in combined
+    assert combined.count("runs-on:") == combined.count("timeout-minutes:")
+
+    external_action = re.compile(r"^\s*uses:\s*([^./\s][^@\s]*)@([^\s#]+)", re.MULTILINE)
+    refs = external_action.findall(combined)
+    assert refs
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for _, ref in refs)
+
+    ci = workflow_sources["ci.yml"]
+    cd = workflow_sources["cd.yml"]
+    assert "HEAD~1" not in cd
+    assert "gh release delete" not in cd
+    assert "git.getRef" in cd
+    assert "git.updateRef" in cd and "git.createRef" in cd
+    ci_config = yaml.load(ci, Loader=yaml.BaseLoader)
+    ci_jobs = ci_config["jobs"]
+    assert ci_config["on"]["push"] == {"branches": ["**"], "tags": ["**"]}
+    initial_checks = {"prepare", "build-site", "test-cpp", "test-python"}
+    for job in initial_checks:
+        assert not ci_jobs[job].get("needs")
+    for frontend in ("esphome", "native", "matter", "sdk"):
+        assert set(ci_jobs[f"build-{frontend}"]["needs"]) == initial_checks
+    sdk = ci_jobs["build-sdk"]
+    assert sdk.get("if", "success()") == "success()"
+    assert sdk["outputs"]["publication"] == "${{ needs.prepare.outputs.publication }}"
+    assert ci_jobs["verify-sdk-component"]["needs"] == "build-sdk"
+    assert ci_jobs["verify-sdk-component"]["with"]["publication"] == "${{ needs.build-sdk.outputs.publication }}"
+    sdk_config = yaml.load(workflow_sources["sdk-component.yml"], Loader=yaml.BaseLoader)
+    assert sdk_config["on"]["workflow_call"]["outputs"]["publication"]["value"] == "${{ jobs.build.outputs.publication }}"
+    sdk_build = sdk_config["jobs"]["build"]
+    assert sdk_build["outputs"]["publication"] == "${{ inputs.publication }}"
+    assert not sdk_build.get("needs")
+    sdk_steps = sdk_build["steps"]
+    consumer = next(step for step in sdk_steps if "verify_sdk_component.py prepare" in step.get("run", ""))
+    assert '--registry-url "$REGISTRY_URL" --package-example' in consumer["run"]
+    caller = ci_jobs["dispatch-publication"]
+    assert set(caller["needs"]) == {
+        "audit-esphome", "audit-matter", "audit-native", "verify-sdk-component",
+    }
+    assert "github.event_name == 'push'" in caller["if"]
+    assert "!github.event.deleted" in caller["if"]
+    assert caller["if"].strip() == (
+        "success() && github.event_name == 'push' && !github.event.deleted && "
+        "contains(fromJSON('[\"snapshot\", \"release\"]'), needs.verify-sdk-component.outputs.publication)"
+    )
+    dispatch = _workflow_job(ci, "dispatch-publication")
+    assert "ref: context.ref" in dispatch
+    assert "source_run_id: String(context.runId)" in dispatch
+    assert "source_run_attempt: process.env.GITHUB_RUN_ATTEMPT" in dispatch
+    assert "source_sha: context.sha" in dispatch
+    assert "workflow_id: 'cd.yml'" in dispatch
+    config = yaml.load(cd, Loader=yaml.BaseLoader)
+    assert set(config["on"]) == {"workflow_dispatch"}
+    assert set(config["on"]["workflow_dispatch"]["inputs"]) == {
+        "source_run_id", "source_run_attempt", "source_sha",
+    }
+    assert "validate_publication_source.cjs" in cd
+    for job in config["jobs"].values():
+        for step in job.get("steps", []):
+            if step.get("uses", "").startswith("actions/download-artifact@"):
+                download = step["with"]
+                if download.get("name") == "signed-firmware-catalog":
+                    continue  # Produced by CD, not by CI.
+                assert "run-id" in download and "github-token" in download
+    validator = (SCRIPTS_DIR / "validate_publication_source.cjs").read_text(encoding="utf-8")
+    for guard in (
+        "source.path !== '.github/workflows/ci.yml'",
+        "source.event !== 'push'",
+        "source.head_repository?.full_name",
+        "source.head_sha !== sha",
+        "source.run_attempt !== attempt",
+        "context.sha !== sha",
+        "source.conclusion !== 'success'",
+        "latest('Build SDK Package')?.conclusion !== 'success'",
+        "latest('Dispatch Publication')?.conclusion !== 'success'",
+    ):
+        assert guard in validator
+    cd_jobs = config["jobs"]
+    assert {
+        job_id: [job["needs"]] if isinstance(job.get("needs"), str) else job.get("needs", [])
+        for job_id, job in cd_jobs.items()
+    } == {
+        "validate-run": [],
+        "release": ["validate-run"],
+        "publish-sdk": ["release"],
+        "verify-sdk": ["publish-sdk"],
+        "publish-coverage": ["release"],
+        "publish-pages": ["release"],
+        "dispatch-pages": ["publish-pages"],
+    }
+    assert cd_jobs["validate-run"]["outputs"]["metadata"] == "${{ steps.source.outputs.metadata }}"
+    assert cd_jobs["release"]["if"] == "needs.validate-run.outputs.current == 'true'"
+    assert cd_jobs["release"]["outputs"]["metadata"] == "${{ needs.validate-run.outputs.metadata }}"
+    assert cd_jobs["publish-sdk"]["outputs"]["metadata"] == "${{ needs.release.outputs.metadata }}"
+    assert cd_jobs["publish-sdk"]["environment"] == "${{ fromJSON(needs.release.outputs.metadata).environment }}"
+    upload = next(step for step in cd_jobs["publish-sdk"]["steps"] if step.get("uses", "").startswith("espressif/upload-components-ci-action@"))
+    assert upload["with"]["registry_url"] == "${{ fromJSON(needs.release.outputs.metadata).registry_url }}"
+    assert upload["with"]["skip_pre_release"] == "${{ fromJSON(needs.release.outputs.metadata).stable }}"
+    verification = cd_jobs["verify-sdk"]
+    assert verification["uses"] == "./.github/workflows/sdk-component.yml"
+    assert verification["if"] == "needs.publish-sdk.outputs.published == 'true'"
+    assert verification["with"]["registry_url"] == (
+        "${{ fromJSON(needs.publish-sdk.outputs.metadata).registry_url }}"
+    )
+    assert verification["with"]["source_run_id"] == (
+        "${{ fromJSON(needs.publish-sdk.outputs.metadata).run_id }}"
+    )
+    for job_id in ("publish-sdk", "publish-coverage", "dispatch-pages"):
+        assert cd_jobs[job_id].get("if", "success()") == "success()"
+    assert cd_jobs["publish-pages"]["if"] == "fromJSON(needs.release.outputs.metadata).publish_website"
+    pages_checkout = next(
+        step for step in cd_jobs["publish-pages"]["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    # validate-run proves that the dispatch revision is the successful CI source;
+    # keep the checkout on that trusted workflow revision instead of accepting a
+    # dynamic ref from job output.
+    assert "ref" not in pages_checkout["with"]
+    coverage_steps = cd_jobs["publish-coverage"]["steps"]
+    assert coverage_steps[0]["with"]["run-id"] == "${{ fromJSON(needs.release.outputs.metadata).run_id }}"
+    assert coverage_steps[0]["with"]["pattern"] == "*-coverage-badge"
+    assert coverage_steps[-1]["env"]["COVERAGE_TAG"] == "${{ fromJSON(needs.release.outputs.metadata).release_tag }}"
+    release_validator = _workflow_job(cd, "validate-run")
+    assert "git merge-base --is-ancestor" in release_validator
+    assert 'validate_release.py --tag "$GITHUB_REF_NAME"' in release_validator
+    tag_validation = next(step for step in cd_jobs["validate-run"]["steps"] if "validate_release.py" in step.get("run", ""))
+    assert tag_validation["if"] == "github.ref_type == 'tag'"
+    prepare_job = ci_jobs["prepare"]
+    metadata = next(step for step in prepare_job["steps"] if step.get("id") == "metadata")
+    for output in ("publication", "version", "channel", "release_tag", "artifact_suffix", "ota_channel", "sign"):
+        assert prepare_job["outputs"][output] == "${{ steps.metadata.outputs." + output + " }}"
+    prepare = metadata["run"]
+    assert "git merge-base --is-ancestor" in prepare
+    assert 'validate_release.py --tag "$GITHUB_REF_NAME"' in prepare
+    preview_tag, develop_tag = _ota_release_tags()
+    for tag in (preview_tag, develop_tag):
+        assert re.search(rf"(?m)^\s+release_tag={re.escape(tag)}$", prepare)
+    assert "detect_git_version.py" in ci
+    assert "detect_git_version.py" in cd
+    for job in ("build-esphome", "build-native", "build-matter", "build-sdk"):
+        build = _workflow_job(ci, job)
+        assert "prepare" in ci_jobs[job]["needs"]
+        assert "needs.prepare.outputs.version" in build
+    for job in ("build-esphome", "build-native"):
+        build = _workflow_job(ci, job)
+        assert "needs.prepare.outputs.sign == 'true' && secrets.FIRMWARE_SIGNING_KEY_RSA" in build
+        assert "needs.prepare.outputs.sign != 'true' && '--test-key'" in build
+    published_channel_action = (
+        REPO_ROOT / ".github" / "actions" / "stage-published-web-channel" / "action.yml"
+    ).read_text(encoding="utf-8")
+    assert "detect_git_version.py" in published_channel_action
+    assert cd.count("uses: ./.github/actions/stage-published-web-channel") == 3
+    for tag in (preview_tag, develop_tag):
+        assert f"release-tag: {tag}" in cd
+        assert f"'{tag}'" in validator
+    assert "release-tag: latest" in cd
+    for expected in (
+        "gh release view",
+        "gh release download",
+        ".github/scripts/stage_web_firmware.py",
+        ".github/scripts/stage_web_sdk.py",
+        "firmware-compliance-*.zip",
+    ):
+        assert expected in published_channel_action
+    for source in (ci, cd):
+        assert "uses: ./.github/actions/build-pages" in source
+        assert "fetch-depth: 0" in source
+    assert "docs/web/artifacts/firmware/release" in cd
+    assert "name: website-sitemap-${{ github.run_attempt }}" in cd
+    assert "path: docs/web/sitemap.xml" in cd
+    assert "workflow_id: 'pages.yml'" in cd
+    pages = workflow_sources["pages.yml"]
+    assert "path: deployed-website" in pages
+    assert "notify_indexnow.py --sitemap deployed-website/sitemap.xml" in pages
+    assert "run.run_attempt !== attempt" in pages
+    assert "latest?.conclusion !== 'success'" in pages
+    assert "pages_artifact', `github-pages-${latest.run_attempt}`" in pages
+    assert "sitemap_artifact', `website-sitemap-${latest.run_attempt}`" in pages
+    assert "ref: ${{ steps.source.outputs.head_sha }}" in pages
+    assert "run.path !== '.github/workflows/cd.yml'" in pages
+    assert "const snapshot = run.head_branch === 'main'" in pages
+    assert "['Validate Source Run', 'Create Release', 'Publish Website']" in pages
+    build_pages = next(step for step in cd_jobs["publish-pages"]["steps"] if step.get("uses") == "./.github/actions/build-pages")
+    for channel in ("preview", "release"):
+        assert build_pages["with"][f"require-{channel}"] == (
+            "${{ fromJSON(needs.release.outputs.metadata).channel == '" + channel +
+            "' && 'true' || steps." + channel + "-assets.outputs.staged }}"
+        )
+    pages_action = (REPO_ROOT / ".github" / "actions" / "build-pages" / "action.yml").read_text(
+        encoding="utf-8"
+    )
+    assert ".github/scripts/build_sitemap.py" in pages_action
+    assert ".github/scripts/generate_sdk_api.py" in pages_action
+    assert "doxygen src/cpp/Doxyfile" not in pages_action
+    generator = load_script("generate_sdk_api")
+    doxygen_action = (REPO_ROOT / ".github/actions/setup-doxygen/action.yml").read_text(encoding="utf-8")
+    assert f'version="{generator.REQUIRED_DOXYGEN_VERSION}"' in doxygen_action
+    assert "doxygen-${version}.linux.bin.tar.gz" in doxygen_action
+    assert ".github/actions/setup-doxygen" in pages_action
+    for job in ("build-sdk", "test-python"):
+        assert ".github/actions/setup-doxygen" in _workflow_job((WORKFLOWS_DIR / "ci.yml").read_text(), job)
+
+    for script_name in (
+        "build_matter_firmware.sh",
+        "build_native_firmware.sh",
+    ):
+        source = (SCRIPTS_DIR / script_name).read_text(encoding="utf-8")
+        assert IDF_DOCKER_IMAGE in source
+        if script_name == "build_native_firmware.sh":
+            assert 'BUILD_DIR="${NATIVE_BUILD_DIR:-build-container-${NATIVE_TARGET}}"' in source
+        else:
+            assert 'BUILD_DIR="build-container-${' in source
+        assert 'detect_git_version.py' in source
+        assert '-e ESPECTRE_GIT_VERSION="${ESPECTRE_GIT_VERSION}"' in source
+        assert ".espectre-requirements-\\${REQUIREMENTS_HASH}" in source
+        assert "--backend local" in source
+
+
+def test_website_sources_integrate_sdk_api_fragments_in_portal_page() -> None:
+    sdk_landing = (REPO_ROOT / "docs" / "web" / "content" / "sdk.html").read_text(
+        encoding="utf-8"
+    )
+    api_orientation = (
+        REPO_ROOT / "docs" / "web" / "content" / "sdk" / "api.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'href="/sdk/api/" class="doc-link"' in sdk_landing
+    assert 'data-api-reference-browser' in api_orientation
+    assert 'data-api-index="/artifacts/sdk/api/api-index.json"' in api_orientation
+    assert 'data-api-reference-content' in api_orientation
+    assert 'data-api-reference-picker' in api_orientation
+    assert 'data-api-reference-filter' in api_orientation
+    assert 'data-api-reference-results' in api_orientation
+    assert 'data-api-reference-toggle' not in api_orientation
+    assert 'data-page-toc' in api_orientation
+    assert 'data-page-path="sdk"' in api_orientation
+    assert 'api-reference-index' not in api_orientation
+    assert '<iframe' not in api_orientation
+
+
+@pytest.fixture(scope="module")
+def firmware_rsa_key():
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(65537, 3072)
+
+
+@pytest.fixture
+def firmware_trust(tmp_path, monkeypatch, firmware_rsa_key):
+    monkeypatch.syspath_prepend(str(SCRIPTS_DIR))
+    signing = importlib.import_module("firmware_signing")
+    registry = tmp_path / "firmware-signing-keys.json"
+    registry.write_text(json.dumps({"schema_version": 1, "keys": [signing.key_record(firmware_rsa_key)]}))
+    monkeypatch.setattr(signing, "PUBLIC_KEYS", registry)
+    return signing, firmware_rsa_key
+
+
+def test_signed_catalog_survives_staging_and_rejects_tampering(tmp_path, firmware_trust):
+    signing, key = firmware_trust
+    builder = load_script("build_firmware_manifest")
+    stager = importlib.import_module("stage_web_firmware")
+    source = tmp_path / "source"
+    source.mkdir()
+    filename = "espectre-matter-3.0.0-esp32c6.bin"
+    (source / filename).write_bytes(b"firmware")
+    args = argparse.Namespace(firmware_dir=source, output=source / "firmware-manifest-release.json",
+                              channel="release", version="3.0.0", release_tag="3.0.0",
+                              commit="a" * 40, url_prefix=None)
+    manifest = builder.build_manifest(args)
+    signing.sign_manifest(manifest, key)
+    args.output.write_text(json.dumps(manifest))
+    signing.verify_manifest(manifest, firmware_dir=source)
+    output = tmp_path / "web"
+    staged = stager.stage_web_firmware(argparse.Namespace(
+        firmware_dir=source, output_dir=output, channel="release", version="3.0.0",
+        release_tag="3.0.0", commit=None, url_prefix="/artifacts/firmware/release", require_signature=True))
+    web = json.loads(staged.read_text())
+    assert web["authentication"] == manifest["authentication"]
+    assert web["frontends"]["matter"]["artifacts"][0]["url"].startswith("/artifacts/")
+    signing.verify_manifest(web, firmware_dir=output)
+    for field, value in (("version", "3.1.0"), ("channel", "preview"), ("commit", "b" * 40)):
+        altered = {**web, field: value}
+        with pytest.raises(ValueError, match="identity"):
+            signing.verify_manifest(altered)
+    unsigned = {name: value for name, value in web.items() if name != "authentication"}
+    with pytest.raises(ValueError, match="not signed"):
+        signing.verify_manifest(unsigned)
+    with pytest.raises(ValueError, match="untrusted"):
+        signing.verify_manifest({**web, "authentication": {**web["authentication"], "key_id": "unknown"}})
+    corrupt = {**web, "authentication": {**web["authentication"], "signature": "AA=="}}
+    with pytest.raises(ValueError, match="signature"):
+        signing.verify_manifest(corrupt)
+    (output / filename).write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="signed hash"):
+        signing.verify_manifest(web, firmware_dir=output)
+    web["frontends"]["matter"]["artifacts"][0]["chip"] = "esp32c3"
+    with pytest.raises(ValueError, match="metadata"):
+        signing.verify_manifest(web)
+
+
+def test_signing_requires_enrolled_release_secrets(monkeypatch, firmware_trust):
+    from cryptography.hazmat.primitives import serialization
+
+    signing, key = firmware_trust
+    monkeypatch.delenv(signing.RSA_SECRET, raising=False)
+    with pytest.raises(ValueError, match="not configured"):
+        signing.private_key_from_secret(signing.RSA_SECRET, "rsa3072")
+    monkeypatch.setenv(signing.RSA_SECRET, key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode())
+    assert signing.key_record(signing.private_key_from_secret(signing.RSA_SECRET, "rsa3072")) == signing.key_record(key)
+    with pytest.raises(ValueError, match="enrolled"):
+        signing.private_key_from_secret(signing.RSA_SECRET, "ecdsa_v1")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_esp_idf_signatures_reject_unsigned_corrupt_and_wrong_key_images(tmp_path, firmware_trust, legacy):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+    signing, rsa_key = firmware_trust
+    key = ec.generate_private_key(ec.SECP256R1()) if legacy else rsa_key
+    private = tmp_path / "test.pem"
+    private.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                          serialization.NoEncryption()))
+    image = tmp_path / "app.bin"
+    image.write_bytes(b"firmware payload" * 256)
+    with pytest.raises(ValueError, match="signature"):
+        signing.verify_app(image, key.public_key(), legacy=legacy)
+    subprocess.run([sys.executable, "-m", "espsecure", "sign-data", str(image), "--version", "1" if legacy else "2",
+                    "--keyfile", str(private)], check=True, capture_output=True)
+    signing.verify_app(image, key.public_key(), legacy=legacy)
+    signing.PUBLIC_KEYS.write_text(json.dumps({"schema_version": 1, "keys": [signing.key_record(key)]}))
+    factory = bytearray(b"\xff" * 0x20000)
+    factory[0x8000:0x8004] = b"\xaa\x50\x00\x10"
+    factory[0x8004:0x8008] = (0x10000).to_bytes(4, "little")
+    factory[0x8008:0x800C] = (0x10000).to_bytes(4, "little")
+    signed_app = image.read_bytes()
+    factory[0x10000:0x10000 + len(signed_app)] = signed_app
+    (tmp_path / "factory.bin").write_bytes(factory)
+    catalog = {"frontends": {
+        "native": {"artifacts": [
+            {"build_type": "ota", "chip": "esp32" if legacy else "esp32c6", "filename": "app.bin"},
+            {"build_type": "factory", "chip": "esp32" if legacy else "esp32c6", "filename": "factory.bin"},
+        ]}, "esphome": {"artifacts": []},
+    }}
+    signing.verify_published_apps(catalog, tmp_path)
+    factory[0x10000 + len(signed_app) - 1] ^= 1
+    (tmp_path / "factory.bin").write_bytes(factory)
+    with pytest.raises(ValueError, match="signed OTA app"):
+        signing.verify_published_apps(catalog, tmp_path)
+    wrong = ec.generate_private_key(ec.SECP256R1()) if legacy else rsa.generate_private_key(65537, 3072)
+    with pytest.raises(ValueError, match="signature"):
+        signing.verify_app(image, wrong.public_key(), legacy=legacy)
+    data = bytearray(image.read_bytes())
+    data[10] ^= 1
+    image.write_bytes(data)
+    with pytest.raises(ValueError, match="signature"):
+        signing.verify_app(image, key.public_key(), legacy=legacy)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_signed_build_gate_rejects_disabled_verification_and_efuse_policy(tmp_path, firmware_trust, legacy):
+    builder = load_script("build_signed_firmware")
+    config = tmp_path / "sdkconfig"
+    profile = builder.native_profile("/temporary/test.pem", legacy=legacy)
+    config.write_text(profile)
+    builder.validate_sdkconfig(config, legacy=legacy)
+    config.write_text(profile.replace("CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y",
+                                      "CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=n"))
+    with pytest.raises(ValueError, match="does not enforce"):
+        builder.validate_sdkconfig(config, legacy=legacy)
+    for name in ("SECURE_BOOT", "SECURE_FLASH_ENC_ENABLED", "BOOTLOADER_APP_ANTI_ROLLBACK"):
+        config.write_text(profile.replace(f"CONFIG_{name}=n", f"CONFIG_{name}=y"))
+        with pytest.raises(ValueError, match="eFuse"):
+            builder.validate_sdkconfig(config, legacy=legacy)
+
+
+def test_sdk_reference_keeps_public_nested_types_and_hides_private_types(tmp_path: Path) -> None:
+    generator = load_script("generate_sdk_api")
+    xml = tmp_path / "service.xml"
+    xml.write_text(
+        '<doxygen><compounddef id="service">'
+        '<innerclass refid="public_config" prot="public">Config</innerclass>'
+        '<innerclass refid="private_response" prot="private">CompletedResponse</innerclass>'
+        '<sectiondef kind="public-func"><memberdef prot="public" id="setup"/></sectiondef>'
+        '<sectiondef kind="private-attrib"><memberdef prot="private" id="queue"/></sectiondef>'
+        '</compounddef></doxygen>',
+        encoding="utf-8",
+    )
+    (tmp_path / "private_response.xml").write_text(
+        '<doxygen><compounddef id="private_response" prot="private"/></doxygen>', encoding="utf-8"
+    )
+    index = tmp_path / "index.xml"
+    index.write_text(
+        '<doxygenindex><compound refid="service"/><compound refid="private_response"/></doxygenindex>',
+        encoding="utf-8",
+    )
+    generator.prune_private_members(tmp_path)
+    compound = ET.parse(xml).getroot().find("compounddef")
+    assert compound is not None
+    assert [node.get("refid") for node in compound.findall("innerclass")] == ["public_config"]
+    assert [node.get("id") for node in compound.findall(".//memberdef")] == ["setup"]
+    assert [node.get("refid") for node in ET.parse(index).getroot().findall("compound")] == ["service"]

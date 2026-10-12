@@ -1,0 +1,28 @@
+# Copy this file outside version control and replace each device_id with the
+# 16-character ID published by that ESPectre node.
+nodes:
+  - node_id: S3_A
+    device_id: "0000000000000001"
+    role: doorway
+  - node_id: S3_B
+    device_id: "0000000000000002"
+    role: internal
+  - node_id: S3_C
+    device_id: "0000000000000003"
+    role: internal
+  - node_id: S3_D
+    device_id: "0000000000000004"
+    role: internal
+
+window_seconds: 4.0
+stale_after_seconds: 3.0
+motion_threshold: 0.35
+minimum_samples: 2
+strong_node_count: 2
+entry_window_seconds: 8.0
+doorway_only_exit_seconds: 1.5
+exit_window_seconds: 8.0
+exit_confirmation_seconds: 5.0
+stillness_seconds: 20.0
+occupied_threshold: 0.75
+empty_threshold: 0.20

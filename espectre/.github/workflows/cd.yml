@@ -1,0 +1,681 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: CI push run containing the verified artifacts
+        required: true
+        type: string
+      source_run_attempt:
+        description: Attempt of the source CI run
+        required: true
+        type: string
+      source_sha:
+        description: Full commit SHA verified by CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-run:
+    name: Validate Source Run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      current: ${{ steps.source.outputs.current }}
+      metadata: ${{ steps.source.outputs.metadata }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Verify the source CI run and completed checks
+        id: source
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const validate = require('./.github/scripts/validate_publication_source.cjs');
+            const publication = context.ref.startsWith('refs/tags/') ? 'release' : 'snapshot';
+            await validate({ github, context, core, publication });
+
+      - name: Revalidate the release tag and main ancestry
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          python3 .github/scripts/validate_release.py --tag "$GITHUB_REF_NAME"
+
+  release:
+    name: Create Release
+    needs: validate-run
+    if: needs.validate-run.outputs.current == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      metadata: ${{ needs.validate-run.outputs.metadata }}
+      version: ${{ steps.package.outputs.version }}
+    permissions:
+      contents: write
+      actions: read
+      discussions: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ fromJSON(needs.validate-run.outputs.metadata).head_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.validate-run.outputs.metadata).run_id }}
+          pattern: firmware-*
+          path: firmware
+          merge-multiple: true
+
+      - name: Download SDK package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.validate-run.outputs.metadata).run_id }}
+          pattern: sdk-*
+          path: sdk
+          merge-multiple: true
+
+      - name: Download registry package and checksums
+        if: fromJSON(needs.validate-run.outputs.metadata).publication == 'release'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.validate-run.outputs.metadata).run_id }}
+          name: registry-component
+          path: registry
+
+      - name: List firmware files
+        run: ls -la firmware/
+
+      - name: List SDK files
+        run: ls -la sdk/
+
+      - name: Select artifact version
+        id: package
+        run: |
+          VERSION="$(python3 .github/scripts/detect_git_version.py --from-sdk-dir sdk)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare snapshot notes
+        if: fromJSON(needs.validate-run.outputs.metadata).publication == 'snapshot'
+        id: snapshot
+        env:
+          SOURCE_BRANCH: ${{ fromJSON(needs.validate-run.outputs.metadata).head_branch }}
+          SOURCE_SHA: ${{ fromJSON(needs.validate-run.outputs.metadata).head_sha }}
+          SOURCE_DATE: ${{ fromJSON(needs.validate-run.outputs.metadata).created_at }}
+        run: |
+          if [ "$SOURCE_BRANCH" = "develop" ]; then
+            echo "title=Development Build" >> "$GITHUB_OUTPUT"
+          else
+            echo "title=Preview Build" >> "$GITHUB_OUTPUT"
+          fi
+          cat > release_notes.md <<EOF
+          ⚠️ **This is an automated rolling build from the \`$SOURCE_BRANCH\` branch.**
+
+          Not recommended for production use. For official releases, use the [latest release](https://github.com/francescopace/espectre/releases/latest).
+
+          **Commit:** $SOURCE_SHA
+          **Date:** $SOURCE_DATE
+          EOF
+
+      - name: Extract release notes from CHANGELOG
+        if: fromJSON(needs.validate-run.outputs.metadata).publication == 'release'
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+
+          # Extract section for this version from CHANGELOG.md
+          # Matches from "## [version]" until the next "## [" or end of file
+          NOTES=$(awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]")) found=1
+            }
+            found { print }
+          ' docs/CHANGELOG.md)
+
+          # Extract title from first line
+          # Format: "## [2.5.0] - 2026-02-08 - Title Here" or "## [2.5.0] - in progress - Title Here"
+          FIRST_LINE=$(echo "$NOTES" | head -1)
+
+          # Split by " - " and get the third part (title)
+          # ## [2.5.0] - in progress - Title  →  parts: "[2.5.0]", "in progress", "Title"
+          TITLE=$(echo "$FIRST_LINE" | awk -F ' - ' '{print $3}')
+
+          # Clean up title
+          TITLE=$(echo "$TITLE" | xargs)  # Trim whitespace
+
+          # If no title, use generic
+          if [ -z "$TITLE" ]; then
+            TITLE="Release"
+          fi
+
+          # If no specific version found, use generic message
+          if [ -z "$NOTES" ]; then
+            NOTES="See [CHANGELOG.md](https://github.com/francescopace/espectre/blob/main/docs/CHANGELOG.md) for details."
+            TITLE="Release"
+          else
+            # Remove first line (header) from body - it's already in the release title
+            NOTES=$(echo "$NOTES" | tail -n +2)
+          fi
+
+          # Save to file for the release action
+          echo "$NOTES" > release_notes.md
+
+          # Save title for release name
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+          echo "=== Release: v${VERSION} - ${TITLE} ==="
+          cat release_notes.md
+
+      - name: Set up firmware signing
+        uses: ./.github/actions/setup-firmware-signing
+
+      - name: Verify firmware matrix and build manifests
+        env:
+          FIRMWARE_SIGNING_KEY_RSA: ${{ secrets.FIRMWARE_SIGNING_KEY_RSA }}
+        run: |
+          python .github/scripts/build_firmware_manifest.py \
+            --firmware-dir firmware \
+            --output firmware/firmware-manifest-${{ fromJSON(needs.validate-run.outputs.metadata).channel }}.json \
+            --channel "${{ fromJSON(needs.validate-run.outputs.metadata).channel }}" \
+            --version "${{ steps.package.outputs.version }}" \
+            --release-tag "${{ fromJSON(needs.validate-run.outputs.metadata).release_tag }}" \
+            --commit "${{ fromJSON(needs.validate-run.outputs.metadata).head_sha }}" \
+            --compliance-url-prefix "https://espectre.dev/artifacts/firmware/${{ fromJSON(needs.validate-run.outputs.metadata).channel }}" \
+            --require-complete-matrix --sign
+
+      - name: Upload signed firmware catalog
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: signed-firmware-catalog
+          overwrite: true
+          path: firmware/firmware-manifest-*.json
+          if-no-files-found: error
+
+      - name: Build firmware compliance bundle
+        run: |
+          python .github/scripts/build_firmware_compliance_bundle.py \
+            --firmware-dir firmware \
+            --output-dir firmware \
+            --channel "${{ fromJSON(needs.validate-run.outputs.metadata).channel }}" \
+            --version "${{ steps.package.outputs.version }}"
+
+      - name: Recheck source commit before publishing
+        if: fromJSON(needs.validate-run.outputs.metadata).publication == 'snapshot'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SNAPSHOT_BRANCH: ${{ fromJSON(needs.validate-run.outputs.metadata).head_branch }}
+          SNAPSHOT_SHA: ${{ fromJSON(needs.validate-run.outputs.metadata).head_sha }}
+        with:
+          script: |
+            const branch = process.env.SNAPSHOT_BRANCH;
+            const expected = process.env.SNAPSHOT_SHA;
+            const response = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch
+            });
+            if (response.data.commit.sha !== expected) {
+              core.setFailed(`Refusing to publish stale commit ${expected}; ${branch} is now ${response.data.commit.sha}.`);
+            }
+
+      - name: Move rolling tag atomically
+        if: fromJSON(needs.validate-run.outputs.metadata).publication == 'snapshot'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SNAPSHOT_TAG: ${{ fromJSON(needs.validate-run.outputs.metadata).release_tag }}
+          SNAPSHOT_SHA: ${{ fromJSON(needs.validate-run.outputs.metadata).head_sha }}
+        with:
+          script: |
+            const tag = process.env.SNAPSHOT_TAG;
+            const sha = process.env.SNAPSHOT_SHA;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let exists = false;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              exists = true;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (exists) {
+              await github.rest.git.updateRef({
+                owner,
+                repo,
+                ref: `tags/${tag}`,
+                sha,
+                force: true
+              });
+            } else {
+              await github.rest.git.createRef({
+                owner,
+                repo,
+                ref: `refs/tags/${tag}`,
+                sha
+              });
+            }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ fromJSON(needs.validate-run.outputs.metadata).release_tag }}
+          target_commitish: ${{ fromJSON(needs.validate-run.outputs.metadata).head_sha }}
+          name: ${{ fromJSON(needs.validate-run.outputs.metadata).publication == 'snapshot' && steps.snapshot.outputs.title || format('v{0} - {1}', fromJSON(needs.validate-run.outputs.metadata).release_tag, steps.changelog.outputs.title) }}
+          body_path: release_notes.md
+          files: |
+            firmware/*.bin
+            firmware/firmware-compliance-*.zip
+            firmware/firmware-manifest-*.json
+            sdk/*.tar.gz
+            sdk/*.zip
+            sdk/*.json
+            ${{ fromJSON(needs.validate-run.outputs.metadata).publication == 'release' && 'registry/*.tgz' || '' }}
+            ${{ fromJSON(needs.validate-run.outputs.metadata).publication == 'release' && 'registry/component-inventory.json' || '' }}
+          draft: false
+          prerelease: ${{ !fromJSON(needs.validate-run.outputs.metadata).stable }}
+          make_latest: ${{ fromJSON(needs.validate-run.outputs.metadata).publication == 'snapshot' && 'false' || '' }}
+          discussion_category_name: ${{ fromJSON(needs.validate-run.outputs.metadata).publication == 'release' && 'Announcements' || '' }}
+          fail_on_unmatched_files: true
+          preserve_order: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Remove superseded manifests and unbundled compliance assets
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          RELEASE_TAG: ${{ fromJSON(needs.validate-run.outputs.metadata).release_tag }}
+          CHANNEL: ${{ fromJSON(needs.validate-run.outputs.metadata).channel }}
+        with:
+          script: |
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: process.env.RELEASE_TAG
+            });
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.data.id,
+              per_page: 100
+            });
+            const legacyNames = new Set(['LICENSE', 'LICENSING.md', 'THIRD_PARTY_NOTICES.md']);
+            const uploadedNames = new Set(assets.map(asset => asset.name));
+            for (const kind of ['firmware', 'sdk']) {
+              if (uploadedNames.has(`${kind}-manifest-${process.env.CHANNEL}.json`)) {
+                legacyNames.add(`${kind}-manifest-${process.env.RELEASE_TAG}.json`);
+              }
+            }
+            const legacySuffixes = [
+              '-sbom.spdx.json',
+              '-THIRD_PARTY_NOTICES.txt',
+              '-third-party-licenses.zip'
+            ];
+            for (const asset of assets) {
+              const supersededOtaManifest = uploadedNames.has(`firmware-manifest-${process.env.CHANNEL}.json`) &&
+                /^espectre-native-ota-esp32(?:c3|c5|c6|s2|s3)?\.json$/.test(asset.name);
+              if (!supersededOtaManifest && !legacyNames.has(asset.name) && !legacySuffixes.some(suffix => asset.name.endsWith(suffix))) {
+                continue;
+              }
+              await github.rest.repos.deleteReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                asset_id: asset.id
+              });
+            }
+
+  publish-sdk:
+    name: Publish SDK
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ fromJSON(needs.release.outputs.metadata).environment }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      published: ${{ steps.source.outputs.current }}
+      metadata: ${{ needs.release.outputs.metadata }}
+    steps:
+      # SDK sources come only from the validated CI artifact.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-sdk-packaging
+      - name: Download the component built and tested by CI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.release.outputs.metadata).run_id }}
+          name: registry-component
+          path: .cache/registry
+      - name: Recheck source commit before publishing
+        id: source
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          PUBLICATION: ${{ fromJSON(needs.release.outputs.metadata).publication }}
+          SOURCE_BRANCH: ${{ fromJSON(needs.release.outputs.metadata).head_branch }}
+          SOURCE_SHA: ${{ fromJSON(needs.release.outputs.metadata).head_sha }}
+        with:
+          script: |
+            if (process.env.PUBLICATION === 'release') {
+              core.setOutput('current', 'true');
+              return;
+            }
+            const response = await github.rest.repos.getBranch({
+              ...context.repo, branch: process.env.SOURCE_BRANCH,
+            });
+            const current = response.data.commit.sha === process.env.SOURCE_SHA;
+            core.setOutput('current', String(current));
+            if (!current) core.info('Skipping the superseded SDK snapshot.');
+      - name: Verify source identity and compare any existing registry version
+        if: steps.source.outputs.current == 'true'
+        id: existing
+        env:
+          SOURCE_SHA: ${{ fromJSON(needs.release.outputs.metadata).head_sha }}
+          PUBLICATION: ${{ fromJSON(needs.release.outputs.metadata).publication }}
+          CHANNEL: ${{ fromJSON(needs.release.outputs.metadata).channel }}
+          REGISTRY_URL: ${{ fromJSON(needs.release.outputs.metadata).registry_url }}
+        run: |
+          args=(--inventory .cache/registry/component-inventory.json
+                --expected-commit "$SOURCE_SHA" --registry-url "$REGISTRY_URL"
+                --wait-seconds 0 --allow-missing)
+          if [ "$PUBLICATION" = "snapshot" ]; then
+            args+=(--snapshot-channel "$CHANNEL")
+          fi
+          python .github/scripts/verify_sdk_component.py check "${args[@]}"
+      - name: Extract the verified upload tree
+        if: steps.source.outputs.current == 'true' && steps.existing.outputs.exists != 'true'
+        run: |
+          python .github/scripts/verify_sdk_component.py extract \
+            --inventory .cache/registry/component-inventory.json \
+            --destination .cache/registry/espectre
+      - name: Upload with trusted GitHub identity
+        if: steps.source.outputs.current == 'true' && steps.existing.outputs.exists != 'true'
+        uses: espressif/upload-components-ci-action@2ce17d73e35473317c1419dbd4f007aacb593040 # v2.2.1
+        with:
+          components: 'espectre: .cache/registry/espectre'
+          namespace: francescopace
+          registry_url: ${{ fromJSON(needs.release.outputs.metadata).registry_url }}
+          repository_url: ''
+          commit_sha: ''
+          skip_pre_release: ${{ fromJSON(needs.release.outputs.metadata).stable }}
+
+  verify-sdk:
+    name: Registry SDK
+    needs: publish-sdk
+    if: needs.publish-sdk.outputs.published == 'true'
+    uses: ./.github/workflows/sdk-component.yml
+    with:
+      registry_url: ${{ fromJSON(needs.publish-sdk.outputs.metadata).registry_url }}
+      source_run_id: ${{ fromJSON(needs.publish-sdk.outputs.metadata).run_id }}
+
+  publish-coverage:
+    name: Publish Coverage Badges
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download available coverage badges
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.release.outputs.metadata).run_id }}
+          pattern: '*-coverage-badge'
+          path: coverage-badges
+          merge-multiple: true
+
+      - name: Find available coverage badges
+        id: badges
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          badges=(coverage-badges/*.json)
+          if (( ${#badges[@]} == 0 )); then
+            echo "::warning::The source CI run produced no coverage badge artifacts."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'Publishing %s\n' "${badges[@]}"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Recheck source commit before publishing coverage
+        if: steps.badges.outputs.available == 'true' && fromJSON(needs.release.outputs.metadata).publication == 'snapshot'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SNAPSHOT_BRANCH: ${{ fromJSON(needs.release.outputs.metadata).head_branch }}
+          SNAPSHOT_SHA: ${{ fromJSON(needs.release.outputs.metadata).head_sha }}
+        with:
+          script: |
+            const branch = process.env.SNAPSHOT_BRANCH;
+            const expected = process.env.SNAPSHOT_SHA;
+            const response = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch
+            });
+            if (response.data.commit.sha !== expected) {
+              core.setFailed(`Refusing to publish stale coverage for ${expected}; ${branch} is now ${response.data.commit.sha}.`);
+            }
+
+      - name: Publish coverage assets
+        if: steps.badges.outputs.available == 'true'
+        shell: bash
+        env:
+          COVERAGE_TAG: ${{ fromJSON(needs.release.outputs.metadata).release_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$COVERAGE_TAG" >/dev/null 2>&1; then
+            echo "::warning::Release $COVERAGE_TAG does not exist yet; coverage badges were not published."
+            exit 0
+          fi
+          gh release upload "$COVERAGE_TAG" coverage-badges/*.json --clobber
+
+  publish-pages:
+    name: Publish Website
+    needs: release
+    if: fromJSON(needs.release.outputs.metadata).publish_website
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      CHANNEL: ${{ fromJSON(needs.release.outputs.metadata).channel }}
+      VERSION: ${{ needs.release.outputs.version }}
+      RELEASE_TAG: ${{ fromJSON(needs.release.outputs.metadata).release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the checked-out Pages revision
+        env:
+          EXPECTED_SHA: ${{ fromJSON(needs.release.outputs.metadata).head_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Set up firmware verification
+        uses: ./.github/actions/setup-firmware-signing
+
+      - name: Download signed firmware catalog
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: signed-firmware-catalog
+          path: published-firmware
+
+      - name: Download publication firmware artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.release.outputs.metadata).run_id }}
+          pattern: firmware-*
+          path: published-firmware
+          merge-multiple: true
+
+      - name: Download publication SDK artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ fromJSON(needs.release.outputs.metadata).run_id }}
+          pattern: sdk-*
+          path: published-sdk
+          merge-multiple: true
+
+      - name: Stage publication web firmware
+        run: |
+          python .github/scripts/stage_web_firmware.py --require-signature \
+            --firmware-dir published-firmware \
+            --output-dir "docs/web/artifacts/firmware/$CHANNEL" \
+            --channel "$CHANNEL" \
+            --version "$VERSION" \
+            --release-tag "$RELEASE_TAG" \
+            --url-prefix "/artifacts/firmware/$CHANNEL" \
+            --commit "${{ fromJSON(needs.release.outputs.metadata).head_sha }}"
+
+      - name: Stage publication web SDK
+        run: |
+          python .github/scripts/stage_web_sdk.py \
+            --sdk-dir published-sdk \
+            --output-dir "docs/web/artifacts/sdk/$CHANNEL" \
+            --channel "$CHANNEL"
+
+      - name: Stage published release channel
+        if: fromJSON(needs.release.outputs.metadata).channel != 'release'
+        id: release-assets
+        uses: ./.github/actions/stage-published-web-channel
+        with:
+          release-tag: latest
+          channel: release
+          firmware-output-dir: docs/web/artifacts/firmware/release
+          sdk-output-dir: docs/web/artifacts/sdk/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Stage published preview channel
+        if: fromJSON(needs.release.outputs.metadata).channel != 'preview'
+        id: preview-assets
+        uses: ./.github/actions/stage-published-web-channel
+        with:
+          release-tag: snapshot
+          channel: preview
+          firmware-output-dir: docs/web/artifacts/firmware/preview
+          sdk-output-dir: docs/web/artifacts/sdk/preview
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Stage published develop channel
+        id: develop-assets
+        uses: ./.github/actions/stage-published-web-channel
+        with:
+          release-tag: snapshot-dev
+          channel: develop
+          firmware-output-dir: docs/web/artifacts/firmware/develop
+          sdk-output-dir: docs/web/artifacts/sdk/develop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Build and verify Pages tree
+        uses: ./.github/actions/build-pages
+        with:
+          require-preview: ${{ fromJSON(needs.release.outputs.metadata).channel == 'preview' && 'true' || steps.preview-assets.outputs.staged }}
+          require-release: ${{ fromJSON(needs.release.outputs.metadata).channel == 'release' && 'true' || steps.release-assets.outputs.staged }}
+          require-develop: ${{ steps.develop-assets.outputs.staged }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          name: github-pages-${{ github.run_attempt }}
+          path: docs/web
+
+      - name: Upload deployed sitemap inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: website-sitemap-${{ github.run_attempt }}
+          overwrite: true
+          path: docs/web/sitemap.xml
+          if-no-files-found: error
+          retention-days: 1
+
+  dispatch-pages:
+    name: Dispatch Website Deployment
+    needs: publish-pages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      actions: write
+
+    steps:
+      - name: Deploy through a branch dispatch and wait for its result
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            // A tag-triggered Pages deployment can silently retain an earlier
+            // artifact for the same SHA. A fresh branch dispatch avoids that path.
+            const response = await github.rest.actions.createWorkflowDispatch({
+              ...context.repo,
+              workflow_id: 'pages.yml',
+              ref: 'main',
+              inputs: {
+                pages_run_id: String(context.runId),
+                pages_run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+              },
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            });
+            const runId = response.data.workflow_run_id;
+            if (!Number.isSafeInteger(runId)) {
+              throw new Error('The Pages dispatch did not return a workflow run ID.');
+            }
+            core.info(`Website deployment: ${response.data.html_url}`);
+            await core.summary.addLink('Website deployment', response.data.html_url).write();
+            const deadline = Date.now() + 23 * 60 * 1000;
+            while (Date.now() < deadline) {
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: runId,
+              });
+              if (run.status === 'completed') {
+                if (run.conclusion !== 'success') {
+                  throw new Error(`Website deployment ${runId}: ${run.conclusion}. See ${run.html_url}`);
+                }
+                core.info('Website deployment and live catalog verification succeeded.');
+                return;
+              }
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+            throw new Error(`Timed out waiting for website deployment ${runId}.`);

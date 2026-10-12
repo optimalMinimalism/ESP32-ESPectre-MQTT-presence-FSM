@@ -1,0 +1,184 @@
+/*
+ * ESPectre - ESP-IDF Runtime
+ *
+ * ESP-IDF runtime that wires Wi-Fi, CSI capture, calibration, and
+ * detection together.
+ *
+ * Author: Francesco Pace <francesco.pace@gmail.com>
+ * SPDX-License-Identifier: GPL-3.0-only
+ * Commercial licensing available under separate agreement; see LICENSING.md.
+ */
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include "core/base_detector.h"
+#include "csi_pipeline.h"
+#include "esp_idf_runtime_base.h"
+#include "runtime/pending_event.h"
+#include "runtime/periodic_sensing_status_logger.h"
+#include "runtime/runtime_diagnostics.h"
+#include "runtime/runtime_config.h"
+#include "runtime/sensing_readiness_gate.h"
+#include "runtime/csi_traffic_service.h"
+#include "core/threshold.h"
+#include "traffic_generator_manager.h"
+#include "udp_listener.h"
+#include "wifi_lifecycle.h"
+
+namespace espectre {
+
+class EspIdfRuntime : public EspIdfRuntimeBase {
+ public:
+  // Owns its traffic sources; destroying it waits for a generator worker that
+  // is still inside a socket call.
+  explicit EspIdfRuntime(const RuntimeConfig &config);
+  // Uses sources that outlive this runtime, so shutdown and destruction never
+  // wait for the generator worker. RuntimeFrontendController does this.
+  EspIdfRuntime(const RuntimeConfig &config,
+                ICsiTrafficGenerator &traffic_generator,
+                ICsiTrafficIngress &traffic_ingress);
+
+  /** Configuration actually applied after persisted overrides are loaded. */
+  const RuntimeConfig &effective_config() const { return config_; }
+  RuntimeSnapshot get_snapshot() const override;
+  RuntimeDiagnosticsSnapshot get_diagnostics() const override;
+  const RuntimeDiagnosticsSample *get_diagnostics_sample() const override;
+
+  bool setup() override;
+  void shutdown() override;
+  void loop() override;
+  bool traffic_allows_radio_work() const override;
+  void hold_pending_traffic_restart(bool hold) override;
+  void set_services_armed(bool armed) override;
+  void set_live_telemetry_enabled(bool enabled) override;
+
+  bool set_threshold(float threshold) override;
+  bool set_motion_hits(uint8_t motion_on_hits, uint8_t motion_off_hits) override;
+  bool set_traffic_generator_mode(TrafficGeneratorMode mode) override;
+  bool set_detection_algorithm(DetectionAlgorithm algorithm) override;
+  bool trigger_recalibration() override;
+  bool is_calibrating() const override;
+  bool start_raw_collection(raw_csi_packet_callback_t callback, void *context) override;
+  bool stop_raw_collection(RawCsiStopReason reason) override;
+  RuntimeOperationState operation_state() const override;
+
+ private:
+  void update_live_telemetry_callback_();
+  void notify_threshold_if_changed_(float threshold);
+  bool configure_detector_();
+  std::unique_ptr<BaseDetector> make_detector_(DetectionAlgorithm algorithm, float threshold,
+                                               uint16_t window_packets);
+  void cancel_calibration_(bool notify_listener);
+  void on_wifi_connected_(const esp_netif_ip_info_t &ip_info);
+  void on_wifi_disconnected_();
+  void invalidate_csi_receive_path_refresh_();
+  void maybe_resume_sensing_after_wifi_reconfigure_();
+  void check_csi_receive_path_();
+  void finish_csi_receive_path_refresh_(esp_err_t result);
+  void refresh_wifi_association_from_csi_();
+  void start_sensing_services_(const esp_netif_ip_info_t &ip_info);
+  void finish_pending_sensing_start_();
+  void request_csi_receive_path_check_(bool after_refresh);
+  void arm_csi_receive_path_check_();
+  CsiCaptureProfile sensing_capture_profile_() const;
+  void begin_capture_shutdown_(bool notify_listener);
+  void stop_sensing_services_();
+  enum class DeferredCaptureAction : uint8_t {
+    None,
+    Disable,
+    DisableThenResumeSensing,
+    DisableThenRearm,
+    ResumeSensing,
+    Rearm,
+    FinishTrafficApply,
+  };
+  enum class CaptureActionResult : uint8_t { Done, Deferred, Failed };
+  CaptureActionResult schedule_capture_action_(DeferredCaptureAction action);
+  CaptureActionResult run_capture_action_(DeferredCaptureAction action);
+  static bool capture_action_disables_(DeferredCaptureAction action);
+  DeferredCaptureAction disable_capture_for_(DeferredCaptureAction action);
+  bool traffic_config_can_start_() const;
+  bool finish_traffic_apply_(bool recalibrate_if_active);
+  void service_deferred_capture_action_();
+  void on_csi_channel_changed_(uint8_t previous_channel, uint8_t current_channel);
+  bool apply_traffic_runtime_config_(bool restart_service, bool recalibrate_if_active);
+  void restore_traffic_runtime_config_(const RuntimeConfig &previous_config);
+  void recalibrate_for_traffic_change_();
+  bool start_calibration_(bool reset_high_accuracy_threshold = true,
+                          std::unique_ptr<StartupThresholdCalibrator> prepared = nullptr);
+  bool handle_threshold_calibration_packet_(const int8_t *csi_data, size_t csi_len,
+                                            int8_t rssi_dbm, bool evaluation_due,
+                                            uint32_t packets_in_window,
+                                            bool temporal_reset);
+  static bool threshold_calibration_packet_callback_(void *context,
+                                                     const int8_t *csi_data,
+                                                     size_t csi_len,
+                                                     int8_t rssi_dbm,
+                                                     bool evaluation_due,
+                                                     uint32_t packets_in_window,
+                                                     bool temporal_reset);
+  void finish_threshold_calibration_(bool success);
+  void refresh_csi_local_identity_(uint32_t local_ip_addr);
+  void update_sensing_readiness_();
+  void log_periodic_status_(uint32_t packets_received);
+  void reset_periodic_status_logger_();
+  void initialize_runtime_state_();
+  void load_persisted_overrides_();
+
+  std::unique_ptr<BaseDetector> detector_;
+  uint16_t resolved_window_packets_{DETECTOR_DEFAULT_WINDOW_SIZE};
+
+  CsiPipeline csi_pipeline_;
+  WiFiLifecycleManager wifi_lifecycle_;
+  TrafficGeneratorManager traffic_generator_;
+  UDPListener traffic_ingress_;
+  CsiTrafficService csi_traffic_service_;
+
+  PeriodicSensingStatusLogger status_logger_{};
+  RuntimeDiagnosticsSampler diagnostics_sampler_{};
+  RuntimeDiagnosticsSample latest_diagnostics_{};
+  RuntimeLoopStepTimer loop_step_timer_;
+  std::unique_ptr<StartupThresholdCalibrator> threshold_calibrator_;
+  CalibrationMotionGuard calibration_motion_guard_{};
+  SensingReadinessGate readiness_gate_{};
+  // Sensing setup of the last successful calibration. A recalibration under
+  // the same setup uses the live threshold as its motion reference.
+  struct CalibratedSetup {
+    bool valid{false};
+    uint8_t channel{0U};
+    CsiCaptureProfile capture_profile{};
+    TrafficGeneratorMode traffic_generator_mode{};
+  } calibrated_setup_{};
+  std::atomic<bool> threshold_calibration_active_{false};
+  // Posted from the CSI callback with the outcome, completed from the loop.
+  PendingEvent<bool> calibration_finished_event_;
+  bool wifi_ready_{false};
+  esp_netif_ip_info_t wifi_ip_info_{};
+  int8_t wifi_rssi_dbm_{INT8_MIN};
+  uint8_t wifi_channel_{0U};
+  bool csi_receive_path_check_pending_{false};
+  bool csi_receive_path_refresh_in_progress_{false};
+  bool csi_receive_path_traffic_seen_{false};
+  // The pending check verifies a completed refresh instead of requesting one.
+  bool csi_receive_path_after_refresh_{false};
+  uint32_t csi_receive_path_check_started_ms_{0U};
+  uint32_t csi_receive_path_last_traffic_ms_{0U};
+  uint32_t csi_receive_path_last_attempt_ms_{0U};
+  uint64_t csi_receive_path_callbacks_at_start_{0U};
+  uint64_t csi_receive_path_traffic_at_start_{0U};
+  uint64_t csi_receive_path_traffic_total_{0U};
+  std::atomic<RuntimeOperationState> operation_state_{RuntimeOperationState::SENSING};
+  DeferredCaptureAction deferred_capture_action_{DeferredCaptureAction::None};
+  bool deferred_traffic_recalibrate_{false};
+  bool capture_updates_suppressed_{false};
+  bool sensing_start_pending_{false};
+  bool arm_receive_path_check_when_traffic_starts_{false};
+  bool hold_traffic_restart_{false};
+  esp_netif_ip_info_t deferred_rearm_ip_{};
+};
+
+}  // namespace espectre
