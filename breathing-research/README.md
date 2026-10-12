@@ -45,6 +45,43 @@ The CSV includes the mean score, score standard deviation, candidate frequency, 
 
 Local recordings and reports are ignored by Git. No live hardware validation is implied by the offline checks.
 
+## Train an exploratory presence model
+
+The presence task has one label: occupied versus empty. Standing, sitting, lying, and typing are all occupied examples. Posture remains metadata and is not a model output. The first model is regularized logistic regression over six score statistics, using 30-second non-overlapping windows after trimming ten seconds from both ends of each uninterrupted sensing segment. It uses no synthetic data.
+
+```bash
+python3 breathing-research/train_presence.py \
+  --data breathing-research/data \
+  --selection breathing-research/reports/posture-review/selection.json \
+  --output breathing-research/reports/presence-baseline-01
+```
+
+Omit `--selection` to train on every recording. With a selection manifest, the script also evaluates the full dataset and reports predictions on the excluded recordings. Every evaluation fold holds out an entire recording, fits feature scaling on training data only, and balances classes and recordings so long recordings do not dominate. The six features are log mean, log median, log 95th percentile, log standard deviation, zero-score fraction, and fraction of scores above 0.001.
+
+Outputs include `model.json`, `evaluation.json`, and per-recording prediction CSVs. The model's sigmoid score is not a calibrated probability. Evaluation averages window scores per held-out recording at a fixed 0.5 threshold; it does not measure live FSM performance or false events per hour. Same-day recording holdouts do not establish transfer across days, people, or rooms. A fresh labeled day must be held out before relying on the model. No predictions alter the FSM.
+
+## Live presence evidence
+
+Run the saved model against your S3's processed motion stream:
+
+```bash
+python3 breathing-research/live_presence.py \
+  --endpoint http://192.168.4.2:62587/espectre/v1
+```
+
+Replace the example address with the S3's Direct API address. The default model is `breathing-research/reports/presence-baseline-01/model.json`; use `--model PATH` for another compatible model. Model artifacts are local and ignored by Git, so another checkout needs its own trained model file.
+
+The detector waits ten seconds to settle and fills a 30-second window, so the first score normally arrives after about 40 seconds. It then evaluates a rolling window every five seconds. This overlapping live cadence differs from the non-overlapping training evaluation and has not been evaluated for false events per hour. Live inference has no end-of-recording trim because future samples are unavailable.
+
+Outputs are `OCCUPIED_EVIDENCE`, `NO_OCCUPIED_EVIDENCE`, `WARMING_UP`, and `UNKNOWN`. A low score does not prove emptiness. Gaps, resets, sensing changes, and stale input clear the history; an interrupted SSE connection reports `UNKNOWN` and exits rather than retaining the previous prediction. Restart the command to reconnect. The script changes no device settings and sends no FSM or MQTT commands. Use `--json` for machine-readable status lines, `--duration 120` for a bounded live run, or Ctrl+C to stop.
+
+Test the same inference logic offline with an existing recording:
+
+```bash
+python3 breathing-research/live_presence.py \
+  --replay breathing-research/data/layingBack-00.jsonl --json
+```
+
 ## Help and offline checks
 
 ```bash
