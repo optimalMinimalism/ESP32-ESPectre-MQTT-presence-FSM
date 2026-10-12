@@ -7,6 +7,7 @@ import io
 import json
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,13 +52,15 @@ class ScoreResearchTests(unittest.TestCase):
                      "capabilities": {"events": ["motion"]}}
         paths = []
         def open_response(request, timeout):
-            url = request if isinstance(request, str) else request.full_url
-            if not isinstance(request, str):
-                self.assertEqual(request.get_method(), "GET")
+            self.assertIsInstance(request, urllib.request.Request)
+            self.assertEqual(request.get_method(), "GET")
+            self.assertEqual(request.get_header("Origin"), "https://test.espectre.dev")
+            url = request.full_url
             resource = url.rsplit("/", 1)[1]
             paths.append(resource)
             if resource != "events":
                 return io.BytesIO(json.dumps(resources[resource]).encode())
+            self.assertEqual(request.get_header("Accept"), "text/event-stream")
             stream = []
             for i in range(240):
                 payload = {"timestamp_ms": i * 250, "state": "idle",

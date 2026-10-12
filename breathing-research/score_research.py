@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+DIRECT_ORIGIN = "https://test.espectre.dev"
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -32,7 +35,8 @@ def api_base(endpoint):
 
 
 def read_json(url):
-    with urllib.request.urlopen(url, timeout=5) as response:
+    request = urllib.request.Request(url, headers={"Origin": DIRECT_ORIGIN})
+    with urllib.request.urlopen(request, timeout=5) as response:
         return json.load(response)
 
 
@@ -65,7 +69,10 @@ def record(args):
 
     def receive():
         try:
-            request = urllib.request.Request(base + "/events", headers={"Accept": "text/event-stream"})
+            request = urllib.request.Request(
+                base + "/events",
+                headers={"Accept": "text/event-stream", "Origin": DIRECT_ORIGIN},
+            )
             with urllib.request.urlopen(request, timeout=15) as response:
                 for event, payload in sse_events(response):
                     if stop.is_set():
