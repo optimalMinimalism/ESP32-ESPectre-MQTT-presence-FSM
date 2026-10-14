@@ -10,13 +10,32 @@ from unittest.mock import patch
 
 try:
     import numpy as np
-    from raw_presence import main, raw_features, raw_windows
+    from raw_presence import main, raw_features, raw_windows, selected_slot_indices
 except ModuleNotFoundError:
     np = None
 
 
 @unittest.skipIf(np is None, "Raw tests require requirements-raw.txt")
 class RawPresenceTests(unittest.TestCase):
+    def test_regular_packet_jitter_does_not_create_false_missing_slots(self):
+        times = np.arange(6000) * 10000 + 1000 * np.sin(np.arange(6000))
+        self.assertEqual(len(selected_slot_indices(times)), 6000)
+
+    def test_static_presence_first_ten_seconds_are_excluded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "occupied.npz"
+            times = np.arange(6000) * 10000
+            csi = np.ones((6000, 128), dtype=np.int8)
+            csi[:1000] = 50
+            np.savez(path, csi_data=csi, device_ticks_us=times, label="static_presence", requested_pps=100)
+            entry = dict(posture="occupied", condition="quiet", session_id="day01", experiment_id="occupied01")
+            with patch("raw_presence.raw_features", wraps=raw_features) as extract:
+                rows, quality = raw_windows(path, entry)
+            selected_csi, selected_times = extract.call_args.args
+            self.assertGreaterEqual(selected_times.min(), 10_000_000)
+            self.assertTrue(np.all(selected_csi == 1))
+            self.assertEqual(rows[0]["start_ms"], 10000)
+
     def test_per_packet_uniform_gain_does_not_change_features(self):
         rng = np.random.default_rng(42)
         csi = rng.integers(1, 10, size=(3000, 128), dtype=np.int8)

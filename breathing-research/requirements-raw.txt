@@ -1,1 +1,5 @@
 numpy>=1.26,<3
+# ESPectre's canonical live HTTP receiver imports CLI common helpers.
+colorama>=0.4,<1
+python-dotenv>=1,<2
+PyYAML>=6,<7

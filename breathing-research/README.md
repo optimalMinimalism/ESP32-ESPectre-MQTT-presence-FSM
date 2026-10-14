@@ -130,6 +130,32 @@ breathing-research/.venv/bin/python breathing-research/compare_models.py \
 
 Choose a new output directory for each run. Whole recordings are held out when only one session exists; with multiple sessions, whole sessions are held out. All folds require both classes in training. The report includes full-data and selected-subset results, per-recording predictions, and separately saved fitted models. The reduced subset is explicitly exploratory. Comparing several models on these same holdouts is not an independent final test: use a fresh labeled session before relying on a model. Tree artifacts are saved as local `.joblib` files; Random Forest and Extra Trees also have JSON exports supported by `live_presence.py`. For example, use `--model breathing-research/reports/model-comparison-01/full-extra_trees.json` after a new comparison run. Generating comparisons does not replace the active model; the currently selected Extra Trees export is stored separately under `reports/presence-extra-trees/`.
 
+## Uploaded raw captures and live raw detection
+
+The October 14 S3 upload has three empty and four static-presence captures. Their paths and occupied/empty labels are in the local `raw_sessions.local.json`. Posture was not recorded, so occupied captures are labeled `occupied` rather than assigned a guessed posture. Analysis excludes the first ten seconds of every static-presence capture, and also trims the last ten seconds. It centers 10 ms sampling slots on packet times so normal timestamp jitter does not create artificial missing slots; the 85% coverage requirement remains unchanged.
+
+Train the raw-only Extra Trees model:
+
+```bash
+breathing-research/.venv/bin/python breathing-research/raw_presence.py \
+  --manifest breathing-research/raw_sessions.local.json \
+  --algorithm extra_trees \
+  --output breathing-research/reports/raw-presence-01
+```
+
+Choose a new output directory for subsequent runs. The first uploaded-data evaluation holds out complete recordings and detects two of four occupied recordings, with two false occupied predictions among three empty recordings. These seven same-day recordings do not establish useful reliability. The processed-score model and its live script remain separate.
+
+Run the raw-only live detector from the repository root:
+
+```bash
+breathing-research/.venv/bin/python breathing-research/live_raw_presence.py \
+  --endpoint http://192.168.4.2:62587/espectre/v1
+```
+
+Replace the address with your S3's. The default model is `reports/raw-presence-01/raw-model.json` under this directory; use `--model PATH` for another compatible raw model. Keep CSI target rate at 100 pps. If the board is already in external mode, the script generates the required UDP traffic; stop other external generators first. In internal mode, the script uses the board's own traffic. The script does not change traffic settings. Opening the raw session pauses normal device motion events, so run it on a research board if your FSM must remain active. Ctrl+C closes the raw connection and stops its traffic generator.
+
+Expect about 40 seconds of settling and window fill, followed by updates every five seconds. Missing or stale CSI produces `UNKNOWN`; low model output means `NO_OCCUPIED_EVIDENCE`, not confirmed emptiness. Use `--duration 120` for a bounded run or `--json` for machine-readable output. Replay is available with `--replay PATH_TO_CAPTURE.npz`; predictions on training recordings are demonstrations, not independent validation.
+
 ## Help and offline checks
 
 ```bash

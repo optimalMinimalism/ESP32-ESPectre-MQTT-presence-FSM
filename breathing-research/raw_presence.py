@@ -21,6 +21,16 @@ RAW_FEATURES = ["log_profile_temporal_std_mean", "log_profile_temporal_std_p95",
 LIVE_BINS = list(range(4, 32)) + list(range(34, 61))
 
 
+def selected_slot_indices(times, origin=None):
+    """Center the grid on a packet, keeping jitter away from slot boundaries."""
+    origin = times[0] if origin is None else origin
+    slots = np.floor((times - origin + 5000) / 10000).astype(np.int64)
+    distances = np.abs(times - (origin + slots * 10000))
+    ordering = np.lexsort((distances, slots))
+    _, first = np.unique(slots[ordering], return_index=True)
+    return ordering[first]
+
+
 def raw_features(csi, times_us):
     # Dataset order is [Q0, I0, Q1, I1, ...]. Widen before arithmetic.
     values = csi.astype(np.float64)
@@ -67,11 +77,7 @@ def raw_windows(path, entry):
             continue
         local = times[indices]
         # One nearest-center packet per 10 ms slot; never synthesize missing CSI.
-        slots = np.floor((local - local[0]) / 10000).astype(np.int64)
-        distances = np.abs(local - (local[0] + slots * 10000 + 5000))
-        ordering = np.lexsort((distances, slots))
-        _, first = np.unique(slots[ordering], return_index=True)
-        chosen = indices[ordering[first]]
+        chosen = indices[selected_slot_indices(local)]
         start, stop = times[chosen[0]] + 10_000_000, times[chosen[-1]] - 10_000_000
         while start + 30_000_000 <= stop:
             selected = chosen[(times[chosen] >= start) & (times[chosen] < start + 30_000_000)]
@@ -93,6 +99,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="New experiment directory")
+    parser.add_argument("--algorithm", choices=["logistic", "extra_trees"], default="logistic")
     args = parser.parse_args()
     try:
         entries = json.loads(args.manifest.read_text())["recordings"]
@@ -100,7 +107,7 @@ def main():
         score_cache = {}
         used_raw, used_score, used_ids = set(), set(), set()
         for entry in entries:
-            if entry["posture"] not in {"empty", "standing", "sitting", "lying_back", "lying_left", "lying_right"}:
+            if entry["posture"] not in {"empty", "occupied", "standing", "sitting", "lying_back", "lying_left", "lying_right"}:
                 raise ValueError("Use an explicit supported posture for presence labels")
             if entry["experiment_id"] in used_ids:
                 raise ValueError("Experiment IDs must be unique")
@@ -129,14 +136,20 @@ def main():
                 paired.append((entry["experiment_id"], path.name, score_path.name))
         session_count = len({r["session_id"] for r in raw})
         group = "session_id" if session_count > 1 else "experiment_id"
-        metrics, predictions = evaluate(raw, RAW_FEATURES, group)
-        model = fit(raw, feature_names=RAW_FEATURES)
+        if args.algorithm == "extra_trees":
+            from compare_models import candidates, export_forest, train, tree_evaluation
+            metrics, predictions = tree_evaluation(raw, "extra_trees", group)
+            model = export_forest(train(candidates()["extra_trees"], raw), raw)
+            model["feature_names"] = RAW_FEATURES
+        else:
+            metrics, predictions = evaluate(raw, RAW_FEATURES, group)
+            model = fit(raw, feature_names=RAW_FEATURES)
         model.update(task="occupied_vs_empty_raw", calibrated=False, threshold=0.5,
                      window_seconds=30, capture_pps=100, trim_seconds=10,
                      live_bins=LIVE_BINS, minimum_slot_coverage=0.85,
                      preprocessing="per-frame live-band mean amplitude normalization",
                      status="experimental raw-only model; not compatible with score live reader")
-        report = {"evaluation_group": group, "raw_metrics": metrics, "quality": quality,
+        report = {"evaluation_group": group, "algorithm": args.algorithm, "raw_metrics": metrics, "quality": quality,
                   "warning": "Matched conditions captured separately; no synchronized fusion or calibrated probabilities. Single-day results are exploratory."}
         paired_rows = []
         if scores:
