@@ -69,7 +69,7 @@ python3 breathing-research/live_presence.py \
   --endpoint http://192.168.4.2:62587/espectre/v1
 ```
 
-Replace the example address with the S3's Direct API address. The default model is `breathing-research/reports/presence-baseline-01/model.json`; use `--model PATH` for another compatible model. Model artifacts are local and ignored by Git, so another checkout needs its own trained model file.
+Replace the example address with the S3's Direct API address. The default model is the full-data Extra Trees model at `breathing-research/reports/presence-extra-trees/model.json`, trained on all 16 recordings. It uses 100 shallow trees and the same six score features. The trees are exported to JSON, so live inference still uses only the Python standard library. Use `--model PATH` for another compatible model; the original logistic model remains at `breathing-research/reports/presence-baseline-01/model.json`. Model artifacts are local and ignored by Git, so another checkout needs its own trained model file.
 
 The detector waits ten seconds to settle and fills a 30-second window, so the first score normally arrives after about 40 seconds. It then evaluates a rolling window every five seconds. This overlapping live cadence differs from the non-overlapping training evaluation and has not been evaluated for false events per hour. Live inference has no end-of-recording trim because future samples are unavailable.
 
@@ -97,13 +97,13 @@ For each trial, first record 60 seconds of processed scores with `score_research
 
 ```bash
 ./espectre collect --target http://192.168.4.2:62587/espectre/v1 \
-  --label empty --duration 60 --pps 100 --detector high_accuracy
+  --label empty --duration 60 --pps 100 --detector lightweight
 
 ./espectre collect --target http://192.168.4.2:62587/espectre/v1 \
-  --label static_presence --duration 60 --pps 100 --detector high_accuracy
+  --label static_presence --duration 60 --pps 100 --detector lightweight
 ```
 
-These are separate commands for separate conditions: leave the room for `empty`, and stay in the desired occupied position for `static_presence`. The CLI prints the saved NPZ path. With a fixed duration, interrupting raw collection discards the recording. Raw collection pauses normal motion events and affects any FSM using them. Use a dedicated research S3 to keep the FSM's sensing nodes running. The collector switches the device to external traffic and leaves it there; restore the previous traffic mode in the panel after collection before resuming ordinary score monitoring. Do not run the live score reader on the same board during raw collection.
+These are separate commands for separate conditions: leave the room for `empty`, and stay in the desired occupied position for `static_presence`. In this checkout, the collector's host detector registry supports only `lightweight`, despite CLI help mentioning High Accuracy. The `--detector` flag chooses the host-side collection readiness check, not the device's sensing profile; keep High Accuracy selected on the device for processed-score recordings. The CLI prints the saved NPZ path. With a fixed duration, interrupting raw collection discards the recording. Raw collection pauses normal motion events and affects any FSM using them. Use a dedicated research S3 to keep the FSM's sensing nodes running. The collector switches the device to external traffic and leaves it there; restore the previous traffic mode in the panel after collection before resuming ordinary score monitoring. Do not run the live score reader on the same board during raw collection.
 
 Copy `raw_sessions.example.json` to `raw_sessions.local.json`, replace the placeholder paths, and add one entry for every trial. Paths are relative to the manifest file. Keep `session_id`, posture, and condition consistent with the matching score recording, and give every pair a unique `experiment_id`. To make a recording distinguishable across days, include the day in its filename. For raw-only training, omit `score_file` from every entry.
 
@@ -116,6 +116,19 @@ breathing-research/.venv/bin/python -m unittest discover -s breathing-research -
 ```
 
 Collect at least two independent empty and two occupied trials for a first exploratory recording holdout. Repeat both classes on another day; with multiple session IDs, the script holds out whole sessions instead. Every training fold must contain both labels. The output includes raw and processed model artifacts, capture-quality summaries, and `cross-examination.csv` showing where the models agree or disagree. Results from separate captures cannot establish synchronized fusion performance. Raw models are not compatible with `live_presence.py`, which expects processed score features.
+
+## Compare small presence models
+
+The optional scikit-learn experiment compares the existing logistic baseline with shallow Random Forest, Extra Trees, and gradient-boosted trees. It keeps the same six features, fixed 0.5 threshold, recording-balanced class weights, and predetermined parameters. It performs no parameter search and does not change the live detector.
+
+```bash
+breathing-research/.venv/bin/python -m pip install -r breathing-research/requirements-models.txt
+breathing-research/.venv/bin/python breathing-research/compare_models.py \
+  --selection breathing-research/reports/posture-review/selection.json \
+  --output breathing-research/reports/model-comparison-01
+```
+
+Choose a new output directory for each run. Whole recordings are held out when only one session exists; with multiple sessions, whole sessions are held out. All folds require both classes in training. The report includes full-data and selected-subset results, per-recording predictions, and separately saved fitted models. The reduced subset is explicitly exploratory. Comparing several models on these same holdouts is not an independent final test: use a fresh labeled session before relying on a model. Tree artifacts are saved as local `.joblib` files; Random Forest and Extra Trees also have JSON exports supported by `live_presence.py`. For example, use `--model breathing-research/reports/model-comparison-01/full-extra_trees.json` after a new comparison run. Generating comparisons does not replace the active model; the currently selected Extra Trees export is stored separately under `reports/presence-extra-trees/`.
 
 ## Help and offline checks
 

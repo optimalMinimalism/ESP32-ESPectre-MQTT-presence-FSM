@@ -8,6 +8,7 @@ import argparse
 import json
 import math
 import queue
+import struct
 import threading
 import time
 import urllib.request
@@ -18,27 +19,67 @@ from score_research import DIRECT_ORIGIN, api_base, positive, read_json, sse_eve
 from train_presence import FEATURES, features, predict
 
 
-DEFAULT_MODEL = Path(__file__).parent / "reports/presence-baseline-01/model.json"
+DEFAULT_MODEL = Path(__file__).parent / "reports/presence-extra-trees/model.json"
 
 
 def load_model(path):
     model = json.loads(path.read_text())
     if model.get("feature_names") != FEATURES or model.get("task") != "occupied_vs_empty":
         raise ValueError("Model task or feature names do not match this detector")
-    for name in ("means", "scales", "coefficients"):
-        values = model[name]
-        if len(values) != len(FEATURES) or not all(math.isfinite(float(x)) for x in values):
-            raise ValueError(f"Invalid model {name}")
-    if any(x <= 0 for x in model["scales"]):
-        raise ValueError("Model scales must be positive")
+    model_type = model.get("model_type", "logistic_regression")
+    if model_type == "tree_ensemble":
+        validate_trees(model)
+    elif model_type == "logistic_regression":
+        for name in ("means", "scales", "coefficients"):
+            values = model[name]
+            if len(values) != len(FEATURES) or not all(math.isfinite(float(x)) for x in values):
+                raise ValueError(f"Invalid model {name}")
+        if any(x <= 0 for x in model["scales"]) or not math.isfinite(model["intercept"]):
+            raise ValueError("Invalid model scales or intercept")
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
     for name in ("window_seconds", "max_gap_ms"):
         if not math.isfinite(model[name]) or model[name] <= 0:
             raise ValueError(f"Invalid model {name}")
-    if not math.isfinite(model["intercept"]) or not 0 <= model["threshold"] <= 1:
-        raise ValueError("Invalid model intercept or threshold")
+    if not 0 <= model["threshold"] <= 1:
+        raise ValueError("Invalid model threshold")
     if not math.isfinite(model.get("trim_seconds", 0)) or model.get("trim_seconds", 0) < 0:
         raise ValueError("Invalid model settling time")
     return model
+
+
+def validate_trees(model):
+    if not model.get("trees") or model.get("input_precision") != "float32":
+        raise ValueError("Model must contain trees and declare float32 input")
+    for tree in model["trees"]:
+        count = len(tree["left"])
+        if not count or any(len(tree[key]) != count for key in ("right", "feature", "threshold", "occupied_probability")):
+            raise ValueError("Inconsistent tree dimensions")
+        for node in range(count):
+            left, right = tree["left"][node], tree["right"][node]
+            probability, threshold = tree["occupied_probability"][node], tree["threshold"][node]
+            if not math.isfinite(threshold) or not 0 <= probability <= 1:
+                raise ValueError("Invalid tree probability or threshold")
+            if left == right == -1:
+                continue
+            if not (isinstance(left, int) and isinstance(right, int) and node < left < count and node < right < count):
+                raise ValueError("Invalid or cyclic tree child indices")
+            if not isinstance(tree["feature"][node], int) or not 0 <= tree["feature"][node] < len(FEATURES):
+                raise ValueError("Invalid tree feature index")
+
+
+def model_score(model, values):
+    if model.get("model_type") != "tree_ensemble":
+        return predict(model, values)
+    # sklearn tree prediction converts inputs to IEEE float32 before routing.
+    values = [struct.unpack("f", struct.pack("f", value))[0] for value in values]
+    total = 0.0
+    for tree in model["trees"]:
+        node = 0
+        while tree["left"][node] != -1:
+            node = tree["left"][node] if values[tree["feature"][node]] <= tree["threshold"][node] else tree["right"][node]
+        total += tree["occupied_probability"][node]
+    return total / len(model["trees"])
 
 
 def sensing_signature(payload):
@@ -130,7 +171,7 @@ class LiveDetector:
         window = [(t, s) for t, s in self.points if t < timestamp]
         if len(window) < 20:
             return self.status("UNKNOWN", "insufficient samples in score window")
-        occupied_score = predict(self.model, features(window))
+        occupied_score = model_score(self.model, features(window))
         return self.status("OCCUPIED_EVIDENCE" if occupied_score >= self.model["threshold"] else "NO_OCCUPIED_EVIDENCE",
                            "experimental model score; low score does not establish an empty room",
                            occupied_score=occupied_score, threshold=self.model["threshold"],

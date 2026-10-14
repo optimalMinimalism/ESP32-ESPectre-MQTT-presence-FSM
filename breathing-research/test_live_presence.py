@@ -7,7 +7,7 @@ import math
 import unittest
 from unittest.mock import patch
 
-from live_presence import LiveDetector, live
+from live_presence import LiveDetector, live, validate_trees
 from train_presence import FEATURES, features, predict
 
 
@@ -23,6 +23,12 @@ def sensing_fixture():
 
 
 class LivePresenceTests(unittest.TestCase):
+    def test_tree_cycles_are_rejected(self):
+        model = {"input_precision": "float32", "trees": [{"left": [0], "right": [0],
+                 "feature": [0], "threshold": [0.5], "occupied_probability": [0.5]}]}
+        with self.assertRaisesRegex(ValueError, "cyclic"):
+            validate_trees(model)
+
     def test_live_window_matches_training_feature_convention(self):
         model = model_fixture()
         detector = LiveDetector(model, sensing_fixture())
